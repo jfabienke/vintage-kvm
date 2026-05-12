@@ -449,21 +449,294 @@ emergency_q        tiny, highest priority
 
 ### On DOS
 
+See [§DOS-side concurrency model](#dos-side-concurrency-model) below for the full design. Summary:
+
 ```
-IRQ1 handler:
-  decode urgent keyboard-lane symbols only
-  set flags; do minimal work
-
-IRQ12 handler:
-  collect AUX control fragments
-  push complete CP frames to control queue
-
-LPT/EPP/ECP loop:
-  move bulk data as fast as possible
-  periodically yield / check control flags
+IRQ1 handler:        emergency keyboard symbols only — tiny, set flags, return
+IRQ12 handler:       AUX bytes → ring buffer with bounded drain — tiny, set flags, return
+Foreground loop:     parse CP frames, pump IEEE 1284 in bounded slices,
+                     check control flags between slices, respect dp_state
 ```
 
-Keep IRQ handlers tiny. The resident driver or polling loop processes frames outside interrupt context.
+Keep ISRs tiny. The resident driver or polling loop processes frames outside interrupt context, and IEEE 1284 is **deliberately not interrupt-driven** on slow DOS hosts.
+
+## DOS-side concurrency model
+
+A slow DOS machine (8088/286/386/486 class) should not handle PS/2 and IEEE 1284 as two fully concurrent, preemptive high-level channels. Handle them as:
+
+```
+PS/2     = interrupt-driven, tiny, high-priority event/control path
+IEEE 1284 = foreground or cooperative bulk pump
+```
+
+In other words: **interrupts capture events; the main loop does the work.** No full frame parsing, CRC, retransmission, decompression, screen processing, or file I/O ever happens inside the PS/2 interrupt handlers.
+
+The bandwidth mismatch is actually helpful here. PS/2 is slow (200–2000 B/s — see [`ps2_private_channel_design.md`](ps2_private_channel_design.md)); IEEE 1284 EPP/ECP is much faster but can be pumped cooperatively from a DOS loop. The slow PS/2 ISRs only need to enqueue work and set flags; the foreground 1284 pump does the actual transport.
+
+### Architecture overview
+
+```
+                +------------------------+
+IRQ1 ---------> | kbd_isr                |
+                | set emergency flags    |
+                +------------+-----------+
+                             |
+IRQ12 --------> +------------v-----------+
+                | aux_isr                |
+                | drain 0x60, ring buffer|
+                +------------+-----------+
+                             |
+                +------------v-----------+
+                | foreground scheduler   |
+                | parse CP frames        |
+                | pump IEEE 1284         |
+                | run jobs               |
+                +------------------------+
+```
+
+### ISR rules
+
+**IRQ1 (keyboard lane) — emergency control only:**
+
+Used for out-of-band symbols: `ABORT`, `ATTENTION`, `RESYNC`, mode switch, bootstrap marker.
+
+```asm
+kbd_isr:
+    in   al, 64h        ; status
+    test al, 01h        ; OBF?
+    jz   .ack
+    in   al, 60h        ; read scan code
+    ; classify tiny symbol against reserved E0-prefixed table
+    ; set bit in kbd_event_flags
+.ack:
+    mov  al, 20h
+    out  20h, al        ; EOI to PIC1
+    iret
+```
+
+No dynamic allocation, no loops except draining one or two bytes, no `INT 21h`, no BIOS calls, no `printf`, no file I/O.
+
+**IRQ12 (AUX lane) — bounded ring-buffer drain:**
+
+```asm
+aux_isr:
+    push ax
+    push bx
+    push cx
+    mov  cx, 16          ; bounded max reads per IRQ — prevents starving LPT
+.drain:
+    in   al, 64h
+    test al, 21h         ; OBF + AUX bit (bit 5 = AUX data available)
+    jz   .done
+    test al, 20h         ; AUX bit
+    jz   .done
+    in   al, 60h         ; read AUX byte
+    ; push al into aux_ring (lock-free: producer = ISR, consumer = foreground)
+    loop .drain
+    ; if ring near full, set FLOW_STOP flag for foreground to send CP_DP_PAUSE
+.done:
+    mov  al, 20h
+    out  0A0h, al        ; EOI to PIC2 (slave)
+    out  20h, al         ; EOI to PIC1 (master) — IRQ12 cascades through slave
+    pop  cx
+    pop  bx
+    pop  ax
+    iret
+```
+
+**Critical:** IRQ12 cascades through the slave PIC, so the handler must EOI both PIC2 (port `0xA0`) *and* PIC1 (port `0x20`). The bounded drain (16 bytes default) prevents AUX traffic from starving the LPT pump on a slow 286/386.
+
+### Foreground scheduler
+
+The TSR / Stage 1 / pico1284 main loop is cooperative:
+
+```c
+while (!done) {
+    /* 1. Emergency first — drains keyboard-lane flags */
+    if (kbd_flags & KBD_ABORT) {
+        cancel_current_job();
+        send_cp_abort_ack();
+        continue;
+    }
+    if (kbd_flags & KBD_RESYNC) {
+        ps2_resync();
+        continue;
+    }
+
+    /* 2. Decode queued AUX control bytes */
+    while (aux_ring_has_frame()) {
+        struct cp_frame cp = aux_decode_frame();
+        handle_control_frame(&cp);
+    }
+
+    /* 3. Apply control decisions */
+    if (dp_state == DP_RESETTING) {
+        reset_lpt_1284();
+        continue;
+    }
+    if (dp_state == DP_PAUSED) {
+        maybe_send_heartbeat();
+        continue;
+    }
+
+    /* 4. Pump bulk data with bounded budget */
+    if (dp_state == DP_ACTIVE) {
+        pump_1284_budget(current_budget);
+    }
+
+    /* 5. Low-priority fallback data */
+    if (dp_state == DP_DEGRADED) {
+        pump_ps2_fallback_data_small_budget();
+    }
+
+    /* 6. Periodic control maintenance */
+    maybe_send_credit_update();
+    maybe_send_heartbeat();
+}
+```
+
+The key call is `pump_1284_budget(N)` — not "pump forever." After each bounded slice the scheduler returns and re-checks PS/2 flags.
+
+### Priority model (strict, bounded)
+
+```
+1. IRQ1 emergency flag                          ← preempts everything at slice boundary
+2. AUX control frames
+3. ACK/NAK / flow control
+4. IEEE 1284 recovery commands
+5. IEEE 1284 bulk pump                          ← bounded slices
+6. PS/2 fallback data jobs
+```
+
+**During `DUAL_PLANE_ACTIVE`:** PS/2 control always preempts IEEE 1284 bulk at slice boundaries.  
+**During `PS2_FALLBACK_MUXED`:** PS/2 control preempts PS/2 fallback data at frame boundaries.
+
+### LPT slice budget per CPU class
+
+The `pump_1284_budget(N)` slice size is machine-dependent:
+
+| CPU class | Bytes per LPT slice | Rationale |
+|---|---:|---|
+| 8088 / XT | n/a (LPT-only, no concurrent PS/2 control plane) | — |
+| 286 | 32–128 | Tight scheduling latency; small AUX rings |
+| 386 | 128–512 | Comfortable dual-lane; ~1 MIPS spare |
+| 486+ | 512–2048 | Plenty of CPU for slice + control servicing |
+
+Adaptive sizing rules:
+
+```
+if aux_ring_fill > high_water:    reduce slice size
+if aux_ring_fill == 0 for K cycles: increase slice size
+if CP heartbeat overdue:           reduce bulk budget
+```
+
+### Buffer sizing per CPU class
+
+```
+kbd_event_flags:       1–2 bytes       (bit flags)
+aux_rx_ring:           128–512 bytes   (smaller on 286)
+aux_tx_ring:           64–256 bytes
+cp_frame_queue:        4–8 frames
+lpt_rx_ring:           2–16 KB         (2 KB on 286, 16 KB on 486+)
+lpt_tx_ring:           2–16 KB
+```
+
+8088/286-class: prefer smaller rings + tighter flow control.  
+386+: 8–16 KB LPT rings are reasonable.
+
+### Flow control is mandatory
+
+The slow DOS host advertises credits based on available buffer space:
+
+```
+CP_DP_CREDIT_UPDATE(bytes_available)
+CP_DP_PAUSE(stream_id)
+CP_DP_RESUME(stream_id, credit)
+```
+
+AUX fallback window (per [`§Fallback multiplexing`](#fallback-multiplexing-when-ieee-1284-is-down)):
+
+```
+4–8 frames outstanding
+16–64 bytes per data chunk
+```
+
+IEEE 1284 window:
+
+```
+sized by lpt_rx_ring free space
+larger frames allowed
+pause/resume commanded over PS/2 (control plane is authoritative)
+```
+
+### Concurrency model per host class
+
+| Host class | Concurrency |
+|---|---|
+| **XT (8088)** | No concurrent PS/2 control plane. LPT/nibble/SPP is the *only* data path. Keyboard lane bootstraps the loader; that's all the keyboard does after Stage 0 entry. (Matches XT row in [`ps2_eras_reference.md`](ps2_eras_reference.md).) |
+| **AT (286+)** | KBD PS/2 = tiny control/unlock path only (no AUX). LPT = data path. Be conservative — DOS software on 286 may be timing-sensitive, and IRQ1 must stay very small. |
+| **PS/2 / Super I/O (386+)** | First comfortable dual-lane setup: KBD IRQ1 = emergency/control; AUX IRQ12 = control + fallback fragments; LPT/EPP/ECP = data. Super I/O is protocol-identical to PS/2 from the peripheral side. |
+| **486 / Pentium** | Same architecture as 386. Increase LPT slice + buffer sizes, **but do not make the ISR heavier just because the machine is faster.** ISR discipline is constant; only the foreground scheduler scales. |
+
+### Timing strategy
+
+Two simple rules:
+
+1. **Never spend more than a small bounded time in an ISR.**
+2. **Never spend more than one LPT slice without checking PS/2 control flags.**
+
+Every 1284 slice:
+
+```
+transfer up to N bytes
+check aux_ring
+check kbd emergency flags
+handle pause/reset/abort
+return to scheduler
+```
+
+On slow hosts, `N` is adaptive based on AUX ring fill and CP heartbeat freshness (see [§LPT slice budget per CPU class](#lpt-slice-budget-per-cpu-class) above).
+
+### DOS reentrancy traps to avoid
+
+DOS is not reentrant. The ISRs must never:
+
+- Call `INT 21h` (any DOS service)
+- Write files
+- Allocate memory
+- Call BIOS keyboard/mouse services (we've replaced those)
+- Call BIOS `INT 16h` / `INT 33h`
+- Do anything that touches DOS internal state
+
+ISR-allowed operations:
+
+```
+read port
+write ring buffer
+set flag
+ACK PIC
+return
+```
+
+Any DOS calls happen only in foreground context, never from interrupt context.
+
+### IEEE 1284 stays deliberately non-interrupt-driven
+
+On a slow DOS host, avoid making IEEE 1284 interrupt-driven even when the LPT chipset supports it (most do, via the IRQ in the control register). Reasons:
+
+- Interrupt nesting on old PIC-based systems causes latency spikes.
+- Two interrupt sources competing for the same slow CPU produces unpredictable timing.
+- The foreground polling loop already runs at a cadence that matches the LPT data rate fine.
+
+**Rule:** only the slow control path (PS/2) gets IRQ priority. The fast data path (IEEE 1284) is deliberately cooperative/polled.
+
+### Final design rule
+
+> **PS/2 interrupts decide what must happen.**  
+> **The foreground scheduler decides when to do it.**  
+> **IEEE 1284 moves bytes only in bounded slices.**
+
+This gives responsive abort/reset/control semantics without overwhelming 286/386-era machines or violating DOS reentrancy constraints.
 
 ## Striping policy when IEEE 1284 is up
 
@@ -726,6 +999,9 @@ Two new firmware modules emerge from this architecture and should be added to [`
 8. **`CONTROL_ONLY` → `MUXED` transition trigger:** how many failed 1284 recovery attempts before opening muxed data services? Default proposal: 3 attempts over 5 seconds, or any user-initiated diagnostic command.
 9. **`MUXED` service whitelist:** which stream IDs may be opened in fallback? Default proposal: 0/1/2/4/5/6 (control, debug console, command responses, diagnostic summaries, recovery, panic frame). Block 3 (file fragments) unless explicitly forced; block 7 (debug console — full bidirectional) unless reduced to summary mode.
 10. **Frame-class encoding in mouse packets:** the `ps2_frame_class` field occupies bits 4–5 of the IntelliMouse byte3 metadata (currently allocated to "type" in [`ps2_private_channel_design.md`](ps2_private_channel_design.md) frame format). Confirm the four-class encoding fits before finalizing.
+11. **AUX ISR bounded-drain count:** default 16 bytes per IRQ12 invocation. Tune per CPU class — 286 may need 8, 486+ may tolerate 32. Empirical only.
+12. **Adaptive LPT slice sizing thresholds:** default high-water for AUX ring is 75% full and low-water is 0 fill for 5 cycles. Tune once real traffic is measured.
+13. **Detection of CPU class at TSR install time:** `pico1284` needs to pick slice/buffer sizes per host. Options: BIOS CPU detect, timing loop calibration, or operator-supplied flag at install. Lean toward CPU detect with timing-loop calibration override.
 
 ## Related documents
 
