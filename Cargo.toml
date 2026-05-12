@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["firmware"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[profile.release]
+codegen-units = 1
+debug = 2
+debug-assertions = false
+incremental = false
+lto = "fat"
+opt-level = "s"
+overflow-checks = false
+
+[profile.dev]
+codegen-units = 1
+debug = 2
+debug-assertions = true
+incremental = false
+opt-level = 1
+overflow-checks = true

@@ -1,0 +1,15 @@
+# Workspace-root cargo config.
+#
+# `firmware/.cargo/config.toml` sets `[build] target` for invocations made
+# from inside `firmware/`. This file makes invocations from the workspace
+# root work too, without poisoning future host-side crates with a thumb
+# target.
+
+[alias]
+fw         = "build -p vintage-kvm-firmware --target thumbv8m.main-none-eabihf"
+fw-release = "build -p vintage-kvm-firmware --target thumbv8m.main-none-eabihf --release"
+fw-run     = "run   -p vintage-kvm-firmware --target thumbv8m.main-none-eabihf --release"
+fw-check   = "check -p vintage-kvm-firmware --target thumbv8m.main-none-eabihf"
+
+[target.thumbv8m.main-none-eabihf]
+runner = "probe-rs run --chip RP235x"

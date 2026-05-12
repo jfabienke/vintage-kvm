@@ -1,0 +1,14 @@
+/target
+/dos/build/
+*.COM
+*.com
+*.obj
+*.OBJ
+*.lst
+*.LST
+*.map
+*.MAP
+
+# macOS
+.DS_Store
+**/.DS_Store
