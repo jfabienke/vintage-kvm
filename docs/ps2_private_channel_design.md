@@ -2,7 +2,7 @@
 
 **Status:** Detailed design document for [`design.md`](design.md) §17 (PS/2 Private Fallback Transport)  
 **Last updated:** 2026-05-12  
-**Companion documents:** [`design.md`](design.md), [`ps2_eras_reference.md`](ps2_eras_reference.md)  
+**Companion documents:** [`design.md`](design.md), [`ps2_eras_reference.md`](ps2_eras_reference.md), [`two_plane_transport.md`](two_plane_transport.md) (this doc covers the L0/L1 wire layer; `two_plane_transport.md` covers L2/L3 session and control-plane semantics)  
 **Maps to roadmap:** Phase 11 in `design.md` §22
 
 This document is the implementation design for the PS/2 private fallback transport — the low-speed bidirectional channel that runs through the Pico's emulated PS/2 keyboard and AUX/mouse ports between Stage 0+ DOS code and the Pico firmware. It exists because the IEEE 1284 path may not always be available (broken negotiation, missing LPT, hostile chipset), and a PS/2-only rescue/control path is required.

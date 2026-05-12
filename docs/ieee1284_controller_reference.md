@@ -2,7 +2,7 @@
 
 **Status:** Reference document  
 **Last updated:** 2026-05-12  
-**Companion document:** [`ps2_eras_reference.md`](ps2_eras_reference.md)
+**Companion documents:** [`ps2_eras_reference.md`](ps2_eras_reference.md), [`two_plane_transport.md`](two_plane_transport.md) (IEEE 1284 is the data plane in the two-plane stack — this doc covers the L0/L1 host-side reference)
 
 When designing the Pico's IEEE 1284 **peripheral** state machine ([`design.md`](design.md) §22 Phases 3–5), the controller side it inter-operates with is the same on every PC LPT chipset — NS PC87332, Winbond W83627, ITE IT87, USS-720, etc. all expose the standard 7-register Extended Capabilities interface at I/O base+0..+6. The Pico's peripheral has to be the wire-side dual of these registers.
 

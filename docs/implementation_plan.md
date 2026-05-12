@@ -2,7 +2,7 @@
 
 **Status:** Living planning document  
 **Last updated:** 2026-05-12  
-**Companion documents:** [`design.md`](design.md), [`hardware_reference.md`](hardware_reference.md), [`ieee1284_controller_reference.md`](ieee1284_controller_reference.md), [`ps2_eras_reference.md`](ps2_eras_reference.md), [`ps2_private_channel_design.md`](ps2_private_channel_design.md)
+**Companion documents:** [`design.md`](design.md), [`hardware_reference.md`](hardware_reference.md), [`ieee1284_controller_reference.md`](ieee1284_controller_reference.md), [`ps2_eras_reference.md`](ps2_eras_reference.md), [`ps2_private_channel_design.md`](ps2_private_channel_design.md), [`two_plane_transport.md`](two_plane_transport.md)
 
 This document is the per-subrepo execution plan that complements the architecture in [`design.md`](design.md). For each subrepo (existing or planned), it specifies directory layout, build pipeline, module responsibilities, phase mapping, and open decisions.
 
@@ -209,7 +209,9 @@ firmware/
 │   ├── session/
 │   │   ├── mod.rs
 │   │   ├── capability.rs          CAP_REQ/RSP/ACK handshake (design.md §10)
-│   │   └── router.rs              packet dispatch
+│   │   ├── control_plane.rs       cp_frame framing + cp_msg_type dispatch + state machine (two_plane_transport.md L3)
+│   │   ├── data_plane.rs          dp_frame framing + stream multiplexer + credit enforcement (two_plane_transport.md L3)
+│   │   └── router.rs              cross-plane packet dispatch
 │   ├── compression/
 │   │   ├── mod.rs
 │   │   ├── rle.rs
