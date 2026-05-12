@@ -120,13 +120,13 @@ The Pico's PIO can **oversample host-to-device traffic at much higher rates than
 | **Marginal-host detection** | Spot hosts whose timing drifts out of spec; surface as a diagnostic to the user |
 | **Collision avoidance** | When the device wants to send but the host is about to inhibit, the oversampling state machine sees the falling edge of clock earlier and aborts the send cleanly |
 
-What this does **not** buy: **higher host-to-device payload rate**. The host is the clock source for host-to-device direction (and the device for device-to-host); the Pico cannot transmit faster than the host clocks accept, and the host clocks at the speed the KBC drives them. The 10–16.7 kHz ceiling is fixed by spec and chipset behavior, not by the Pico.
+What this does **not** buy: **higher host-to-device payload rate**. The PS/2 device supplies the shift clock for both byte directions (host-to-device too — the host signals "request to send" by manipulating Clock/Data, then the device clocks each data bit while the host drives the Data line); but the host controls *when* a host-to-device transfer begins, and the Super I/O controls what bit-cell timing it accepts as valid. The Pico can tune bit timing, but it cannot make the host issue command bytes faster, and it cannot bypass the i8042 receive path. The 10–16.7 kHz envelope is fixed by host-side tolerance, not by what the Pico can drive.
 
-Implication: oversampling goes into the Pico's PS/2 PIO programs and Rust state machine as a quality and observability feature. It improves reliability and diagnostics; it does not raise throughput.
+Implication: oversampling goes into the Pico's PS/2 PIO programs and Rust state machine as a quality and observability feature. **It improves reliability and observability; it does not raise throughput.**
 
 ## What the RP2350 can and cannot control
 
-The PS/2 device generates the clock for both directions. The RP2350 owns the device end and therefore owns the clock. **But the limiting factor is the host's Super I/O receiver**, not the RP2350's transmitter. The RP2350 can drive cleaner and faster signalling than the spec requires; the host may or may not accept it.
+The PS/2 device supplies the shift clock for both byte directions. For device-to-host, the device clocks bits the device puts on the Data line. For host-to-device, the host first signals "request to send" (pulls Clock low briefly, then releases and pulls Data low), at which point the device begins clocking each bit while the host drives the Data line; the device samples Data on its own clock edges and ACKs at the end. So the RP2350 owns the bit-cell timing in both directions, **but the host owns when host-to-device transfers begin, and the Super I/O owns what timing it accepts as valid**. The Pico can drive cleaner and faster signalling than the spec requires; the host may or may not accept it, and it cannot force higher host command throughput.
 
 **Controllable from RP2350 side:**
 
@@ -279,32 +279,57 @@ DOS-side (s0_at.asm / s0_ps2.asm + pico1284):
 
 **Frame format over AUX mouse packets** (proposal, refines `design.md` §17.2):
 
+The default approach keeps every emitted byte **looking like a legal PS/2 mouse packet**, so unexpected paths (BIOS, SMM, ACPI mouse drivers running in parallel, virtual-machine input layers) treat the bytes as benign mouse data rather than malformed packets. Stage 0 owns IRQ12 and routes vintage-kvm traffic off to the receiver before any of those paths see it, but **survivability through "I didn't expect to see this packet" code paths is higher when the bytes themselves are spec-legal.**
+
 ```
-PS/2 fragment (carried inside one or more 3-byte or 4-byte mouse packets):
+PS/2 fragment (carried inside IntelliMouse 4-byte mouse packets):
 
-  Packet 0 (sync/header):
-    byte0: status byte with reserved bit pattern → "this is a vintage-kvm frame, not real mouse data"
-           bits 7..6: lane_id (00 = AUX, 01 = KBD echo, 10/11 reserved)
-           bits 5..4: frame type (00 = data, 01 = ack, 10 = nak, 11 = control)
-           bits 3..0: sequence number (mod 16)
-    byte1: payload length (low byte)
-    byte2: payload length (high byte)
-    byte3 (IntelliMouse): frame-CRC16-init or first payload byte
+  Status byte template (byte0) — always spec-legal:
+    bit 0: L button   = 0
+    bit 1: R button   = 0
+    bit 2: M button   = 0
+    bit 3: always-1   = 1     ← required by PS/2 spec
+    bit 4: X-sign     = 0
+    bit 5: Y-sign     = 0
+    bit 6: X-overflow = 0
+    bit 7: Y-overflow = 0
+    = 0x08
 
-  Packets 1..N (payload):
-    byte0: marker — same reserved pattern
-    byte1..byte2: payload bytes (2/packet for 3-byte mouse mode; 3/packet for IntelliMouse)
-    byte3 (IntelliMouse): payload byte
+  Header packet (start of each frame):
+    byte0: 0x08                ← legal quiescent status
+    byte1: 0x7F                ← escape sentinel A (legal as +127 dx with no sign)
+    byte2: 0x81                ← escape sentinel B (legal as -127 dy with no sign)
+    byte3: lane_id<<6 | type<<4 | seq    ← IntelliMouse 4th byte; frame metadata
+              bits 7..6: lane_id (00 = AUX, 01 = KBD echo, 10/11 reserved)
+              bits 5..4: type (00 = data, 01 = ack, 10 = nak, 11 = control)
+              bits 3..0: sequence number (mod 16)
 
-  Last packet:
-    CRC-16-CCITT over payload
+  Length packet (immediately follows header):
+    byte0: 0x08
+    byte1: payload_len_lo
+    byte2: payload_len_hi
+    byte3: reserved / first payload byte
+
+  Payload packets:
+    byte0: 0x08
+    byte1..byte3: 3 payload bytes per packet
+
+  Trailer:
+    byte0: 0x08
+    byte1: crc16_lo
+    byte2: crc16_hi
+    byte3: 0x00
 
 Ack/Nak via host command byte (host → Pico via 0xD4 + cmd):
   0x55: ACK seq N
   0xAA: NAK seq N, request resend
 ```
 
-The reserved status-byte pattern is what tells the receiver "this is vintage-kvm traffic, not a real mouse movement." A real PS/2 mouse always emits status byte with bit 3 = 1; we use bit 3 = 0 as our discriminator. The host driver's mouse handler is bypassed entirely because vintage-kvm owns IRQ12.
+The receiver discriminates vintage-kvm frames from real mouse activity by looking for the `0x7F 0x81` pair in byte1/byte2 of a packet with byte0 = 0x08. A real mouse could plausibly emit (status=0x08, dx=+127, dy=-127, byte3=0) during a fast diagonal stroke — collision probability is small but nonzero. To reduce it further, the receiver requires two consecutive packets matching the header pattern (escape + valid metadata) before committing to "frame in progress." Once committed, payload packets need only byte0=0x08 to be parsed.
+
+**Alternative discriminator** (more aggressive, less portable): use byte0 with X-overflow + Y-overflow bits set (`0xC8`). Real mice rarely set both overflow bits — any sane driver discards such packets, so collision is near-zero. **But:** if any intermediate path (BIOS legacy mouse handler, virtual machine input, fallback driver) sees a 0xC8 packet, it may flag it as protocol error or reset the mouse. Use only when Stage 0 has confirmed exclusive IRQ12 ownership and no other consumer exists.
+
+The host driver's mouse handler is bypassed entirely because vintage-kvm owns IRQ12 — but the legal-byte default protects against the cases where that bypass leaks.
 
 **Flow control** (matches `design.md` §17.3): credit-based, mirroring the IEEE 1284 packet layer. Don't let the AUX lane free-run into the controller.
 
@@ -330,7 +355,7 @@ The reserved status-byte pattern is what tells the receiver "this is vintage-kvm
 
 ## Open decisions
 
-1. **Mouse-packet reserved pattern:** the proposal above uses status-byte bit 3 = 0 to mark vintage-kvm frames. Confirm this doesn't conflict with any IntelliMouse-extension-specific encoding; if it does, pick a different reserved bit pattern.
+1. **Mouse-packet frame discriminator:** the proposal above uses spec-legal `byte0=0x08, byte1=0x7F, byte2=0x81` as the frame-start escape (every byte looks like a normal mouse packet). The more aggressive alternative is `byte0=0xC8` (overflow bits set) — near-zero collision but rejected by sane drivers if any intermediate path sees it. Choose the legal-byte default unless Stage 0 has confirmed total IRQ12 ownership with no other consumer.
 2. **Lane 0 (keyboard) encoding for control bytes:** `E0`-prefix + reserved scan code, or use of an unused break/make code, or a vendor-defined hotkey? Decide before Phase 11 implementation.
 3. **Sample-rate negotiation tuning:** PS/2 mouse sample rates are 10, 20, 40, 60, 80, 100, 200 reports/s. Default is 100. For data-plane use, set the highest the host accepts to maximize throughput, but watch for hosts that fail above 80.
 4. **Credit-window size:** `design.md` §17.3 mentions credit-based flow but doesn't specify window. Initial proposal: 8 packets each direction, expandable based on measured RTT.
