@@ -51,10 +51,21 @@ DISCOVER_LPT
   ↓
 NEGOTIATE_1284
   ↓
-DUAL_PLANE_ACTIVE
-  ↓
-DEGRADED_PS2_ONLY / RECOVER_1284
+DUAL_PLANE_ACTIVE  ←──────────────────────────────┐
+  ↓ 1284 failure                                  │
+PS2_FALLBACK_ENTER                                │
+  ↓                                               │
+PS2_FALLBACK_CONTROL_ONLY ──── 1284 restored ─────┤
+  ↓ if stable, recovery not imminent              │
+PS2_FALLBACK_MUXED ────────── 1284 restored ──────┘
 ```
+
+The two fallback sub-states are:
+
+- **`PS2_FALLBACK_CONTROL_ONLY`** — entered immediately on IEEE 1284 failure. Only session control, heartbeat, 1284 recovery negotiation, and small diagnostics flow. **No data services.** Goal: assess whether the data plane can be restored before committing the PS/2 link to degraded data work.
+- **`PS2_FALLBACK_MUXED`** — entered if `CONTROL_ONLY` stays stable and 1284 recovery is judged unlikely soon. Multiplexes control + small degraded data over the AUX lane. Explicitly reduced service set (see [§Fallback multiplexing](#fallback-multiplexing-when-ieee-1284-is-down) below).
+
+On 1284 recovery from either sub-state, the session transitions back to `DUAL_PLANE_ACTIVE` and PS/2 returns to its control-only role.
 
 ### 1. BOOTSTRAP
 
@@ -454,15 +465,215 @@ LPT/EPP/ECP loop:
 
 Keep IRQ handlers tiny. The resident driver or polling loop processes frames outside interrupt context.
 
-## Striping policy
+## Striping policy when IEEE 1284 is up
 
 **Should PS/2 AUX carry data when IEEE 1284 is up?** Only in three cases:
 
 1. Control-plane payloads too large for the keyboard lane.
-2. Rescue data while IEEE 1284 is down.
+2. Rescue data while IEEE 1284 is down (covered in [§Fallback multiplexing](#fallback-multiplexing-when-ieee-1284-is-down) below).
 3. Redundant metadata for high-value transfers — e.g., final hash, last-good sequence, job result.
 
 Otherwise, **do not stripe bulk data across PS/2 and IEEE 1284.** The rate mismatch is too large (PS/2 ~ 200–1500 B/s vs IEEE 1284 ~ 2–8 MB/s), ordering becomes messy, and PS/2's main value is independence from the data plane.
+
+## Fallback multiplexing when IEEE 1284 is down
+
+In `PS2_FALLBACK_MUXED`, PS/2 carries both control and degraded data. **Multiplex by frame, never by byte** — no untyped byte stream with escape codes. The PS/2 fallback transport is latency-bounded and recoverable, not high-throughput.
+
+### Lane assignment in fallback
+
+```
+Keyboard lane / IRQ1:
+  emergency control only
+  attention, abort, resync, mode switch, bootstrap
+
+AUX lane / IRQ12:
+  multiplexed framed transport
+  control frames + degraded data frames
+```
+
+The keyboard lane stays reserved for out-of-band emergency — it remains the only path that survives if AUX itself gets stuck.
+
+### Frame classification
+
+The existing AUX frame format from [`ps2_private_channel_design.md`](ps2_private_channel_design.md) carries a frame-type field in the IntelliMouse byte3 metadata. Extended for fallback multiplexing:
+
+```c
+enum ps2_frame_class {
+    PS2_CLASS_CONTROL   = 0x0,
+    PS2_CLASS_DATA      = 0x1,
+    PS2_CLASS_ACK       = 0x2,
+    PS2_CLASS_MGMT      = 0x3,
+};
+
+struct ps2_fallback_frame {
+    uint8_t  magic;
+    uint8_t  version;
+    uint8_t  frame_class;   // ps2_frame_class
+    uint8_t  stream_id;
+    uint8_t  seq;
+    uint8_t  ack;
+    uint8_t  flags;
+    uint8_t  len;
+    uint8_t  payload[len];
+    uint16_t crc16;
+};
+
+// flags byte
+//   bit 0: urgent
+//   bit 1: checkpoint
+//   bit 2: retransmit
+//   bit 3: end_of_job
+```
+
+These frames are then mouse-packet-encoded onto the AUX lane per the wire-format design.
+
+### Scheduler priority
+
+Strict priority with fairness caps:
+
+1. Emergency keyboard-lane events (KBD IRQ1 wakes a flag)
+2. AUX `PS2_CLASS_CONTROL` frames
+3. AUX `PS2_CLASS_ACK` / `PS2_CLASS_MGMT` frames (flow control, heartbeat)
+4. AUX `PS2_CLASS_DATA` (small interactive — debug console responses, command results)
+5. AUX `PS2_CLASS_DATA` (bulk/degraded — job chunks)
+
+**The crucial rule:** *a pending control frame must be able to preempt data between PS/2 frames.* Not mid-byte (we never interrupt a partial mouse packet), but at the next packet/frame boundary.
+
+### Reserved scheduling capacity
+
+Data credits must never consume all transport capacity. Reserve a minimum control budget per scheduling window:
+
+```
+8-packet scheduling window (default):
+  4 packets — data
+  2 packets — ACK / flow control
+  1 packet  — control
+  1 packet  — emergency / mgmt reserve
+
+If no control/mgmt is pending in a slot, data may borrow it.
+```
+
+This guarantees heartbeat, abort, and `CP_DP_RESET` always have a transmission opportunity within ~one window even under data saturation.
+
+### Stream IDs in fallback
+
+Keep logical stream IDs so the muxed transport is compatible with the normal data-plane architecture:
+
+```
+stream 0 = control / session
+stream 1 = emergency console / debug text
+stream 2 = small command responses
+stream 3 = file fragments — tiny only
+stream 4 = diagnostic summaries
+stream 5 = 1284 recovery negotiation
+stream 6 = screen panic frame / text-mode status only
+```
+
+**Do not carry normal screen/video bulk over PS/2 fallback** except for a tiny diagnostic mode. Streams 0–4 in this table reuse semantics from the main data-plane stream IDs where possible; stream 5 is fallback-specific.
+
+### Chunking and job migration
+
+Data chunks in fallback are aggressively small (16–64 bytes before ACK/checkpoint) to keep retransmission cost low and control latency bounded.
+
+Large operations become **job-based and resumable**:
+
+```
+JOB_START job_id, type, total_size
+DATA_CHUNK job_id, seq=0, payload (≤64 B)
+DATA_CHUNK job_id, seq=1, payload
+…
+JOB_CHECKPOINT job_id, range, hash
+JOB_DONE job_id
+```
+
+When IEEE 1284 recovers, the same job can migrate back to the data plane mid-flight:
+
+```
+PS/2:        CP_DP_RECOVERED
+             MIGRATE_JOB job_id, next_offset
+IEEE 1284:   resumes bulk transfer from next_offset
+```
+
+This is the main architectural win of muxed fallback: degraded service continues, and recovery is non-disruptive.
+
+### Semantic compression for diagnostics
+
+Because PS/2 fallback is painfully slow, prefer semantic summaries over raw data wherever possible:
+
+| Instead of | Send |
+|---|---|
+| full log dump | error code + last N events + counters + first bad seq + CRC mismatch details |
+| full screen frame | screen-mode change notice + text-mode status row |
+| full memory dump | hash + addresses of differing regions + first 64 B of each |
+| firmware blob | refusal to fallback (firmware updates require IEEE 1284) |
+
+For diagnostics, the summary is usually enough either to recover IEEE 1284 or to tell the user what failed.
+
+### Scheduling example
+
+```
+Pending queues:
+  control_q:   CP_DP_RESET_1284, CP_DP_HEALTH
+  ack_q:       ACK seq=42
+  data_q:      debug chunk 12, debug chunk 13
+
+Transmit order:
+  1. CONTROL: CP_DP_RESET_1284
+  2. ACK:     ACK seq=42
+  3. CONTROL: CP_DP_HEALTH (heartbeat)
+  4. DATA:    debug chunk 12
+  5. DATA:    debug chunk 13
+```
+
+If the keyboard lane emits `ABORT` mid-sequence:
+
+```
+KBD IRQ1: ABORT marker
+AUX scheduler:
+  finish current mouse-packet fragment (don't truncate mid-packet)
+  inject CONTROL: ABORT_CONFIRM at next boundary
+  drop / cancel lower-priority data job
+```
+
+### IEEE 1284 recovery is the primary "data" use of PS/2 fallback
+
+The main reason PS/2 carries non-control bytes in fallback is to **repair the data plane**:
+
+```
+CONTROL frames carry:
+  - 1284 failure class report
+  - request to re-probe LPT
+  - select EPP/ECP/SPP fallback mode
+  - reset 1284 transceiver command
+  - re-open data plane
+
+DATA frames carry:
+  - small diagnostic artifacts only, when recovery is not converging
+```
+
+Normal loop:
+
+1. Enter `PS2_FALLBACK_CONTROL_ONLY`.
+2. Attempt to recover IEEE 1284.
+3. If recovery fails after N attempts, transition to `PS2_FALLBACK_MUXED`.
+4. Permit only explicitly degraded services on the muxed link.
+5. Continue periodic recovery attempts; transition back to `DUAL_PLANE_ACTIVE` if they succeed.
+
+### What NOT to do in fallback
+
+- Strip the same bulk stream across both KBD and AUX lanes.
+- Let the keyboard lane carry ordinary data.
+- Send full screen deltas, full logs, firmware blobs, or bus traces over PS/2.
+- Let data frames block `HEARTBEAT`, `ABORT`, or `RESET`.
+- Use one untyped byte stream with escape codes for everything.
+- Try to make PS/2 fallback reliable by widening retransmit windows — keep chunks small instead.
+- Treat `PS2_FALLBACK_MUXED` as a long-term operating mode; it's a bridge to recovery, not a destination.
+
+### Architectural rule for fallback
+
+> **In fallback mode, PS/2 carries both control and degraded data, but control frames are always prioritized and data services are explicitly reduced to small, resumable jobs.**
+
+This gives a robust rescue channel without letting the fallback path become a slow, fragile imitation of IEEE 1284.
 
 ## Layered protocol stack
 
@@ -511,6 +722,10 @@ Two new firmware modules emerge from this architecture and should be added to [`
 4. **Stream-ID ownership:** is stream 2 (KBD/mouse injection) bidirectional, or strictly Pico → DOS? Probably bidirectional once `host/` exists so the modern host can also drive virtual keystrokes.
 5. **CP_TIME_SYNC semantics:** what time domain — Pico monotonic, modern-host wall-clock, or something else? Affects how trace marks and log records align across the planes.
 6. **Authoritative protocol-constants file:** since both `cp_*` and `dp_*` constants must match across `firmware/` (Rust), `host/` (Rust), and `dos/pico1284/` (C/asm), the codegen-vs-hand-maintained choice from [`implementation_plan.md`](implementation_plan.md) §5 becomes acute. Lean toward a single TOML/YAML spec with code-gen to all three languages.
+7. **Fallback scheduling window size:** default proposal is 8 packets (4 data / 2 ACK / 1 control / 1 mgmt reserve). Tune based on observed control-frame latency under saturation.
+8. **`CONTROL_ONLY` → `MUXED` transition trigger:** how many failed 1284 recovery attempts before opening muxed data services? Default proposal: 3 attempts over 5 seconds, or any user-initiated diagnostic command.
+9. **`MUXED` service whitelist:** which stream IDs may be opened in fallback? Default proposal: 0/1/2/4/5/6 (control, debug console, command responses, diagnostic summaries, recovery, panic frame). Block 3 (file fragments) unless explicitly forced; block 7 (debug console — full bidirectional) unless reduced to summary mode.
+10. **Frame-class encoding in mouse packets:** the `ps2_frame_class` field occupies bits 4–5 of the IntelliMouse byte3 metadata (currently allocated to "type" in [`ps2_private_channel_design.md`](ps2_private_channel_design.md) frame format). Confirm the four-class encoding fits before finalizing.
 
 ## Related documents
 
