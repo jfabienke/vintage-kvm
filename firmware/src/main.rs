@@ -40,6 +40,7 @@ mod telemetry;
 mod transport;
 mod util;
 
+use lifecycle::SupervisorState;
 use lpt::compat::SppNibblePhy;
 use protocol::{handle_packet, DispatchOutcome, SessionState};
 use telemetry::{DefmtEmit, Event, TelemetryEmit};
@@ -78,6 +79,11 @@ async fn main(spawner: Spawner) {
     // GP7 = on-board red LED (status heartbeat).
     let led = Output::new(p.PIN_7, Level::Low);
     spawner.spawn(status::heartbeat::run(led).expect("spawn heartbeat"));
+
+    // GP21 = NeoPixel WS2812 (visible supervisor lifecycle indicator).
+    // Owns PIO2 SM0 + DMA_CH0 per docs/pico_firmware_design.md §4.2.
+    spawner
+        .spawn(status::neopixel::run(p.PIO2, p.PIN_21, p.DMA_CH0).expect("spawn neopixel"));
 
     // LPT pin allocation per `docs/hardware_reference.md` §3.3 and
     // `docs/pico_phase3_design.md`. nInit (host strobe) routing TBD;
@@ -118,6 +124,11 @@ async fn main(spawner: Spawner) {
     );
 
     let transport = LptTransport::new(phy, DefmtEmit);
+
+    // Phase 3 jumps straight into CAP handshake — no PS/2 detect / DEBUG
+    // injection yet. The LED flips to magenta-blink once SEND_BLOCK traffic
+    // starts; left as a TODO until the dispatcher emits per-block events.
+    lifecycle::set(SupervisorState::ServeCapHandshake);
 
     info!("LPT SPP-nibble transport ready; entering serve loop");
     serve_loop(transport).await;

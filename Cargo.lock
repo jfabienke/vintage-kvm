@@ -1489,6 +1489,7 @@ dependencies = [
  "embassy-time",
  "heapless 0.8.0",
  "panic-probe",
+ "smart-leds",
  "vintage-kvm-protocol",
  "vintage-kvm-signatures",
  "vintage-kvm-telemetry-schema",
