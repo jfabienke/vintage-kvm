@@ -1589,6 +1589,8 @@ Exact allocation should be revised after PIO program sizing.
 
 ## 21. DOS Software Architecture
 
+**Future target architecture:** [`aishell_design.md`](aishell_design.md) expands this section into a full two-runtime design (AISHELL REAL pure-Assembly + AISHELL DPMI Watcom C `AICORE`) for the Stage 2 client — AI-native DOS shell, transport executive, human/AI session arbiter, with graceful fallback ladders from DPMI → REAL → COMMAND.COM and from IEEE 1284 → PS/2-only → local.
+
 ### 21.1 Languages
 
 ```text

@@ -6,7 +6,7 @@
 
 - Architecture: [`design.md`](design.md), [`two_plane_transport.md`](two_plane_transport.md)
 - Hardware: [`hardware_reference.md`](hardware_reference.md), [`ieee1284_controller_reference.md`](ieee1284_controller_reference.md), [`ps2_eras_reference.md`](ps2_eras_reference.md), [`ps2_private_channel_design.md`](ps2_private_channel_design.md)
-- DOS side: [`stage0_design.md`](stage0_design.md), [`stage1_design.md`](stage1_design.md), [`stage1_implementation.md`](stage1_implementation.md)
+- DOS side: [`stage0_design.md`](stage0_design.md), [`stage1_design.md`](stage1_design.md), [`stage1_implementation.md`](stage1_implementation.md), [`aishell_design.md`](aishell_design.md)
 - Pico side: [`pico_firmware_design.md`](pico_firmware_design.md), [`pico_phase3_design.md`](pico_phase3_design.md), [`pio_state_machines_design.md`](pio_state_machines_design.md), [`instrumentation_surface.md`](instrumentation_surface.md), [`firmware_crate_and_trait_design.md`](firmware_crate_and_trait_design.md)
 
 This document is the per-subrepo execution plan that complements the architecture in [`design.md`](design.md). For each subrepo (existing or planned), it specifies directory layout, build pipeline, module responsibilities, phase mapping, and open decisions.
@@ -57,7 +57,7 @@ vintage-kvm/
 | 1 | `firmware/` | RP2350 Pico firmware | **Phase 3 MVP (~13 KB)** — bit-bang LPT SPP-nibble + CRC-16 packet protocol + CAP/PING/block-server dispatch. PIO designs ready: [`pio_state_machines_design.md`](pio_state_machines_design.md), instrumentation surface: [`instrumentation_surface.md`](instrumentation_surface.md). | Replace bit-bang with PIO programs; add PS/2 oversampler+demod for Phase 1 |
 | 2 | `dos/stage0/` | DOS Stage 0 bootstrap | **3 of 3 variants build** | Hardware-validate AT/PS2 private channels |
 | 3 | `dos/stage1/` | DOS Stage 1 loader | **v1.0 scaffold (4821 B)** — builds `PICO_BOOT` env block, shrinks via `AH=4Ah`, EXECs `PICO1284.EXE` via `AH=4Bh`; child errorlevel propagates | Per [`stage1_design.md`](stage1_design.md): auto-downgrade ladder once EPP/ECP byte pumps land |
-| 4 | `dos/pico1284/` | DOS Stage 2 TSR/CLI | **Stub** | Install Open Watcom V2; set up wmake build alongside NASM |
+| 4 | `dos/pico1284/` | DOS Stage 2 TSR/CLI | **Stub** (49 B placeholder served by Stage 1). Future target: AISHELL ([`aishell_design.md`](aishell_design.md)) — REAL+DPMI two-runtime AI-native DOS shell | Install Open Watcom V2; set up wmake build alongside NASM; eventually realize as AISHELL |
 | 5 | `dos/common/` | Shared NASM/C headers | **Not created (YAGNI)** | Create on first cross-stage constant |
 | 6 | `host/` | Modern-host USB CDC client | **Not created, language undecided (Rust recommended)** | Decide language; scaffold workspace member |
 | 7 | `tools/` | Dev fixtures + tooling | **Not created** | First tool: `tools/tui/` — ratatui dashboard consuming the Pico's CDC telemetry stream ([`instrumentation_surface.md` §4](instrumentation_surface.md)); ships in Phase 6 |
@@ -508,7 +508,11 @@ Target size: ≤8 KB blob (well within Stage 0's `MAX_STAGE1_SIZE = 50000`).
 
 ### Purpose
 
-Production DOS client per `design.md` §21.1. Either a `.COM`, `.EXE`, or TSR depending on use case. Per `design.md` §21.2, it has modules:
+Production DOS client per `design.md` §21.1. Either a `.COM`, `.EXE`, or TSR depending on use case.
+
+**Future target architecture:** [`aishell_design.md`](aishell_design.md) — AISHELL is the target replacement for this module once the bootstrap chain is hardware-validated. It is a two-runtime system (REAL mode pure-Assembly + DPMI mode Watcom C `AICORE`) that grows the current Stage 2 placeholder into an AI-native DOS shell, transport executive, and human/AI session arbiter. The per-file plan below remains the **current** approach; AISHELL is the long-term direction.
+
+Per `design.md` §21.2, the current per-file plan has modules:
 
 ```
 port_detect.asm/c      detect LPT base, ECP/EPP capability, ECP DMA channel + IRQ
