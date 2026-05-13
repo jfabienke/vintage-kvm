@@ -38,6 +38,7 @@ AISHELL must always degrade safely from DPMI to REAL, from IEEE 1284 to PS/2 fal
 AISHELL shall provide:
 
 - Local human shell operation.
+- Remote-human operation through the modern host bridge.
 - AI co-pilot observation and suggestions.
 - Structured AI tool-call endpoint.
 - PS/2 control/fallback transport.
@@ -46,7 +47,7 @@ AISHELL shall provide:
 - Console capture.
 - Text-mode screen snapshot.
 - Program execution with output/result capture.
-- Memory inspection primitives.
+- Minimal raw memory inspection primitives.
 - Transport recovery and diagnostics.
 - Safe fallback to COMMAND.COM.
 
@@ -56,10 +57,10 @@ The AI host shall be able to:
 
 - Observe human-entered commands.
 - Observe command output and screen state.
-- Detect build errors and transport failures.
+- Detect build errors and transport failures using host-side analysis.
 - Suggest commands, patches, next steps, or explanations.
 - Execute approved actions through structured tools.
-- Defer to the human operator at all times.
+- Defer to the human operator or configured remote-operator policy at all times.
 
 ### 2.3 Compatibility goals
 
@@ -73,6 +74,30 @@ AISHELL shall support these machine classes:
 | 386+ with EMM386/QEMM | DPMI/V86-aware | Real-mode shim plus protected-mode core. |
 | 486+ | DPMI preferred | Better buffers, file transfer, co-pilot experience. |
 | Windows 9x DOS box | DPMI-safe | Hardware may be virtualized; conservative probing required. |
+
+### 2.4 Scope discipline principle
+
+The DOS-side runtime shall stay as small and dumb as practical. Anything that can be done on the modern host without losing correctness should be done on the modern host.
+
+Host-side responsibilities include:
+
+- JSON-facing tool schema.
+- AI reasoning.
+- Source-code analysis.
+- Patch generation.
+- Build-error recognition.
+- Rich memory decoding.
+- Long-term logs.
+- Artifact comparison and diffing.
+- UI presentation.
+
+DOS-side AISHELL responsibilities are limited to:
+
+- Hardware capture and transport.
+- Safe execution of approved actions.
+- Raw data access.
+- Minimal local arbitration.
+- Recovery.
 
 ---
 
@@ -301,7 +326,7 @@ That approach is clever but fragile across DPMI hosts. Prefer polling shared rin
 
 ### 6.1 Startup probes
 
-AISHELL `/AUTO` performs these probes:
+AISHELL performs these probes when no runtime is explicitly forced:
 
 1. CPU class.
 2. V86 flag.
@@ -326,29 +351,46 @@ AISHELL `/AUTO` performs these probes:
 | V86 without stable DPMI | REAL-safe |
 | Unknown hardware behavior | REAL-safe |
 
-#### 6.1.2 User overrides
+#### 6.1.2 User-facing syntax
+
+Common case should be simple:
 
 ```
-AISHELL /AUTO
-AISHELL /REAL
-AISHELL /TSR
-AISHELL /DPMI
-AISHELL /PM
+AISHELL
 AISHELL /SAFE
-AISHELL /TINY
 AISHELL /ASSISTED
-AISHELL /AUTOAI
+AISHELL /AUTO
 ```
 
-Note: `/AUTOAI` means AI autonomous policy mode, not runtime auto-selection. Avoid naming collision by preferring `/AUTO` for runtime and `/MODE=AUTO` for AI policy.
-
-Recommended final syntax:
+Runtime selection is auto-detected by default. Runtime override is for diagnostics and development:
 
 ```
-AISHELL /RUNTIME=AUTO|REAL|DPMI
-AISHELL /POLICY=SAFE|MANUAL|OBSERVE|SUGGEST|ASSISTED|AUTO
-AISHELL /PROFILE=TINY|NORMAL|FULL|DEBUG
+AISHELL /RUNTIME=REAL
+AISHELL /RUNTIME=DPMI
+AISHELL /RUNTIME=AUTO
 ```
+
+Policy mode is operator-facing:
+
+```
+AISHELL /POLICY=SAFE
+AISHELL /POLICY=MANUAL
+AISHELL /POLICY=OBSERVE
+AISHELL /POLICY=SUGGEST
+AISHELL /POLICY=ASSISTED
+AISHELL /POLICY=AUTO
+```
+
+Profiles control footprint and debug behavior:
+
+```
+AISHELL /PROFILE=TINY
+AISHELL /PROFILE=NORMAL
+AISHELL /PROFILE=FULL
+AISHELL /PROFILE=DEBUG
+```
+
+Avoid `/AUTOAI`; use `/POLICY=AUTO` instead.
 
 ---
 
@@ -427,6 +469,8 @@ A conventional-memory shared block is the boundary between the real-mode Assembl
 
 ### 8.1 Shared block layout
 
+The shared block must be small in TINY/NORMAL builds and extensible in DEBUG builds.
+
 ```c
 #define AIS_RM_MAGIC 0xA15E
 #define AIS_RM_VERSION 0x0001
@@ -441,13 +485,16 @@ struct ais_rm_shared {
     volatile uint16_t policy_state;
     volatile uint16_t kbd_head;
     volatile uint16_t kbd_tail;
-    uint8_t kbd_ring[128];
+    uint8_t kbd_ring[AIS_KBD_RING_SIZE];
     volatile uint16_t aux_head;
     volatile uint16_t aux_tail;
-    uint8_t aux_ring[512];
+    uint8_t aux_ring[AIS_AUX_RING_SIZE];
     volatile uint16_t tx_head;
     volatile uint16_t tx_tail;
-    uint8_t tx_ring[512];
+    uint8_t tx_ring[AIS_TX_RING_SIZE];
+    volatile uint16_t elog_head;
+    volatile uint16_t elog_count;
+    struct ais_event_log_entry event_log[AIS_EVENT_LOG_SIZE];
     volatile uint32_t bios_ticks_seen;
     volatile uint32_t irq1_count;
     volatile uint32_t irq12_count;
@@ -456,9 +503,16 @@ struct ais_rm_shared {
     volatile uint16_t last_error;
     volatile uint16_t command_flags;
     volatile uint16_t kick_flags;
-    uint8_t reserved[128];
+};
+struct ais_event_log_entry {
+    uint16_t event_id;
+    uint16_t arg0;
+    uint16_t arg1;
+    uint32_t timestamp;
 };
 ```
+
+The event log is intentionally tiny. Its purpose is crash forensics: after AICORE fails, the REAL shim can report the last N significant events.
 
 ### 8.2 Ring rules
 
@@ -470,11 +524,11 @@ struct ais_rm_shared {
 
 Recommended profiles:
 
-| Profile | KBD ring | AUX ring | TX ring |
-|---|---|---|---|
-| TINY | 64 | 128 | 128 |
-| NORMAL | 128 | 512 | 512 |
-| DEBUG | 256 | 2048 | 2048 |
+| Profile | KBD ring | AUX ring | TX ring | Event log |
+|---|---:|---:|---:|---:|
+| TINY | 32 | 64 | 64 | 8 entries |
+| NORMAL | 64 | 256 | 256 | 16 entries |
+| DEBUG | 256 | 2048 | 2048 | 64 entries |
 
 ---
 
@@ -654,7 +708,9 @@ FRAME_HELLO
 FRAME_HELLO_ACK
 FRAME_TOOL_CALL
 FRAME_TOOL_RESULT
+FRAME_TOOL_CANCEL
 FRAME_EVENT
+FRAME_EVENT_BATCH
 FRAME_SUGGESTION
 FRAME_ACK
 FRAME_NAK
@@ -664,13 +720,89 @@ FRAME_STREAM_OPEN
 FRAME_STREAM_CLOSE
 ```
 
-### 12.3 Tool IDs
+`FRAME_TOOL_CANCEL` cancels an in-flight tool call by `call_id`. Cancellation is cooperative first. If the call owns a child process or blocking transport operation, AISHELL escalates according to the timeout/cancellation policy in §14.6.
+
+### 12.3 HELLO capability exchange
+
+Capability negotiation is mandatory. Both sides must tolerate unknown feature bits and TLVs.
+
+`FRAME_HELLO` payload:
+
+```c
+struct ais_hello {
+    uint16_t protocol_version;
+    uint16_t min_protocol_version;
+    uint16_t build_id;
+    uint16_t runtime_mode;       /* REAL, DPMI, SAFE */
+    uint16_t cpu_class;          /* 8088, 286, 386, 486, ... */
+    uint16_t feature_words;      /* number of following uint32_t words */
+    uint32_t feature_bits[];
+};
+```
+
+Initial feature bits:
+
+```
+bit 0   PS2_KBD_LANE
+bit 1   PS2_AUX_LANE
+bit 2   IEEE1284_SPP
+bit 3   IEEE1284_EPP
+bit 4   IEEE1284_ECP
+bit 5   IEEE1284_ECP_DMA
+bit 6   DPMI_CORE
+bit 7   REAL_SAFE_CORE
+bit 8   FS_BASIC
+bit 9   FS_TRANSFER
+bit 10  EXEC_RUN
+bit 11  CONSOLE_TEXT
+bit 12  SCREEN_TEXT
+bit 13  SCREEN_GRAPHICS
+bit 14  MEM_READ
+bit 15  MEM_MAP_RAW
+bit 16  COPILOT_EVENTS
+bit 17  COPILOT_SUGGESTIONS
+bit 18  EVENT_BATCHING
+bit 19  TIMEOUTS
+bit 20  RATE_LIMITS
+bit 21  REMOTE_OPERATOR_MODE
+bit 22  EVENT_LOG
+```
+
+Feature-bit allocation policy:
+
+```
+bits 0-31 live in feature_bits[0]
+bits 32-63 live in feature_bits[1]
+future bits extend feature_bits[] without changing the frame layout
+producers may add bits without bumping protocol_version
+consumers must ignore unknown bits
+protocol_version changes only for incompatible wire-format changes
+```
+
+`FRAME_HELLO_ACK` returns the intersection of supported features plus negotiated limits:
+
+```c
+struct ais_hello_ack {
+    uint16_t protocol_version;
+    uint16_t session_id;
+    uint16_t runtime_mode;
+    uint16_t policy_mode;
+    uint16_t max_control_frame;
+    uint16_t max_data_frame;
+    uint16_t max_event_batch;
+    uint16_t max_tool_timeout_s;
+    uint32_t negotiated_features[];
+};
+```
+
+### 12.4 Tool IDs
 
 ```c
 enum ais_tool_id {
     T_SYSTEM_INFO       = 0x0001,
     T_TRANSPORT_STATUS  = 0x0010,
     T_SESSION_STATUS    = 0x0020,
+    T_EVENT_LOG_READ    = 0x0030,
     T_FS_LIST           = 0x0100,
     T_FS_STAT           = 0x0101,
     T_FS_READ           = 0x0102,
@@ -684,8 +816,7 @@ enum ais_tool_id {
     T_SCREEN_TEXT       = 0x0310,
     T_SCREEN_SNAPSHOT   = 0x0311,
     T_MEM_READ          = 0x0400,
-    T_MEM_MAP           = 0x0401,
-    T_MEM_DECODE        = 0x0402,
+    T_MEM_MAP_RAW       = 0x0401,
     T_POLICY_STATUS     = 0x0500,
     T_POLICY_SET_MODE   = 0x0501,
     T_COPILOT_EVENT     = 0x0600,
@@ -693,6 +824,38 @@ enum ais_tool_id {
     T_COPILOT_FEEDBACK  = 0x0602
 };
 ```
+
+### 12.5 Tool-call envelope
+
+Every tool call includes common control fields:
+
+```c
+struct ais_tool_call_header {
+    uint16_t tool_id;
+    uint16_t call_id;
+    uint16_t side_effect_class;
+    uint16_t flags;
+    uint32_t timeout_ms;
+    uint32_t byte_budget;
+    uint32_t rate_budget_bytes_per_min;
+};
+```
+
+`timeout_ms` is mandatory for mutating and executing calls. A zero timeout means "use policy default," not "infinite."
+
+`call_id` is the cancellation and correlation handle. `FRAME_TOOL_CANCEL` references the same `call_id` and may be sent by the host bridge when the remote operator or AI policy wants to abort a long-running operation without tearing down the session.
+
+### 12.6 Timestamp policy
+
+AISHELL uses a tiered timestamp model:
+
+| Source | Availability | Resolution | Use |
+|---|---|---|---|
+| BIOS tick counter | universal DOS | ~55 ms | baseline event ordering and fallback timestamps |
+| PIT-derived sub-tick counter | AT+ when enabled | implementation-defined, higher resolution | latency measurement, batching cadence, diagnostics |
+| Host bridge timestamp | modern host | high resolution | durable logs and AI-facing timelines |
+
+REAL shared-block timestamps use a 32-bit monotonic tick value. In TINY/REAL-safe mode, this is BIOS ticks. In DPMI/NORMAL mode, AICORE may combine BIOS ticks with a PIT-derived sub-tick counter for finer local timing. The host bridge should treat DOS timestamps as monotonic ordering hints and apply host-side wall-clock timestamps for durable logs.
 
 ---
 
@@ -706,9 +869,9 @@ AISHELL should emit events for:
 
 - Command entered.
 - Command completed.
-- Error line detected.
+- Error summary detected by local boundary heuristics.
 - Screen changed substantially.
-- File changed.
+- File-change batch.
 - Program executed.
 - Transport degraded/recovered.
 - Human requested help.
@@ -716,17 +879,19 @@ AISHELL should emit events for:
 
 AISHELL should not stream every raw keystroke by default.
 
+AISHELL should also avoid per-line output events on slow machines. Raw output should be captured into a buffer or data-plane stream, while the control plane receives batches or summaries.
+
 ### 13.2 Event IDs
 
 ```c
 enum ais_event_id {
     E_COMMAND_ENTERED       = 0x0001,
     E_COMMAND_FINISHED      = 0x0002,
-    E_OUTPUT_LINE           = 0x0003,
-    E_ERROR_LINE            = 0x0004,
+    E_OUTPUT_BATCH          = 0x0003,
+    E_ERROR_SUMMARY         = 0x0004,
     E_SCREEN_CHANGED        = 0x0005,
     E_SCREEN_TEXT_SNAPSHOT  = 0x0006,
-    E_FILE_CHANGED          = 0x0007,
+    E_FILE_CHANGED_BATCH    = 0x0007,
     E_EXEC_STARTED          = 0x0008,
     E_EXEC_FINISHED         = 0x0009,
     E_TRANSPORT_DEGRADED    = 0x0010,
@@ -735,6 +900,50 @@ enum ais_event_id {
     E_SUGGESTION_ACCEPTED   = 0x0030,
     E_SUGGESTION_REJECTED   = 0x0031
 };
+```
+
+#### 13.2.1 Event batching
+
+Use `FRAME_EVENT_BATCH` for frequent events.
+
+Output batching policy:
+
+```
+Emit control-plane event after:
+  - N milliseconds,
+  - M lines,
+  - buffer high-water mark,
+  - command completion,
+  - explicit error boundary.
+```
+
+Default suggested values:
+
+```
+N = 250-500 ms on 386+
+N = 500-1000 ms on 286/slow hosts
+M = 16-64 lines depending on profile
+```
+
+The batch event carries metadata:
+
+```c
+struct ais_output_batch_event {
+    uint16_t line_count;
+    uint16_t error_count;
+    uint16_t flags;
+    uint32_t data_ref;       /* optional IEEE 1284 stream ref */
+    uint32_t byte_count;
+};
+```
+
+File-change batching policy:
+
+```
+Aggregate changed paths until:
+  - command exits,
+  - batch reaches max entries,
+  - timeout expires.
 ```
 
 ### 13.3 Suggestion lifecycle
@@ -775,12 +984,17 @@ AISHELL serializes DOS execution while allowing concurrent human and AI intent.
 ```c
 enum console_owner {
     OWNER_HUMAN,
+    OWNER_REMOTE_HUMAN,
     OWNER_AI,
     OWNER_CHILD_PROGRAM,
     OWNER_SHARED_MONITOR,
     OWNER_RECOVERY
 };
 ```
+
+`OWNER_REMOTE_HUMAN` covers the common workflow where the operator is not at the DOS keyboard but is using the modern host UI while watching screen snapshots and approving AI actions remotely.
+
+For v1, AISHELL treats the host bridge as trusted. It does not authenticate the remote human directly. Authentication, user identity, and remote UI authorization belong on the modern host side. AISHELL only sees policy decisions and approved tool calls from the trusted bridge.
 
 ### 14.2 Job classes
 
@@ -807,7 +1021,7 @@ OBSERVE:
 SUGGEST:
   AI can propose commands or patches.
 ASSISTED:
-  AI can prepare actions; human approves.
+  AI can prepare actions; human approves locally or remotely.
 AUTO:
   AI can execute policy-approved actions within scope.
 ```
@@ -828,6 +1042,44 @@ DESTRUCTIVE
 ```
 
 AISHELL policy gates tool execution by side-effect class.
+
+### 14.5 Budgets and anti-DoS policy
+
+Side-effect class is not sufficient. Every policy grant also has resource budgets.
+
+Budget dimensions:
+
+```
+timeout_ms
+max_bytes_per_call
+max_bytes_per_minute
+max_files_per_call
+max_events_per_minute
+max_runtime_seconds
+max_transfer_window
+```
+
+`timeout_ms` is the per-tool-call execution deadline. `max_runtime_seconds` is a broader policy budget for a job/session scope, which may contain multiple tool calls.
+
+Examples:
+
+```
+fs.read is READ_ONLY, but may still be denied if file size > budget.
+console.capture is READ_ONLY, but may be rate-limited.
+exec.run requires timeout and console ownership.
+mem.read may be size-limited even when allowed.
+```
+
+Policy enforcement occurs before dispatch and during long-running operations.
+
+### 14.6 Time-bounded operations
+
+Every mutating, executing, transport-reset, or potentially blocking tool call must have a timeout. On timeout:
+
+1. AISHELL attempts cooperative cancel.
+2. If a child program is active, AISHELL attempts Ctrl-Break or configured abort sequence.
+3. AISHELL reports timeout result to host.
+4. AISHELL may enter recovery mode if the foreground state is unknown.
 
 ---
 
@@ -895,6 +1147,8 @@ fs.transfer_put
 
 Large payloads use IEEE 1284 when available; PS/2 fallback uses small chunks only.
 
+File operations are budgeted by size, rate, path scope, and policy mode.
+
 ### 16.2 Execution services
 
 ```
@@ -905,11 +1159,12 @@ exec.run_command
 Execution model:
 
 1. Acquire console/job lock.
-2. Prepare capture hooks.
-3. Execute child through DOS.
-4. Regain control on exit.
-5. Capture exit code, screen, changed files, output.
-6. Emit event/result to AI host.
+2. Require timeout.
+3. Prepare capture hooks.
+4. Execute child through DOS.
+5. Regain control on exit or timeout.
+6. Capture exit code, screen, changed-file batch, output batch metadata.
+7. Emit event/result to AI host.
 
 ### 16.3 Console capture
 
@@ -919,6 +1174,8 @@ Capture layers:
 2. INT 10h BIOS output where feasible.
 3. Text VRAM snapshot.
 4. Keyboard injection for interactive programs.
+
+Raw captured output should be buffered or streamed over the data plane; control plane should receive summaries/batches.
 
 ### 16.4 Screen tools
 
@@ -939,13 +1196,14 @@ screen.delta
 
 ### 16.5 Memory tools
 
-V1:
+V1 DOS-side memory tool should be intentionally dumb:
 
 ```
 mem.read
-mem.map
-mem.decode BDA/IVT/MCB
+mem.map_raw
 ```
+
+AISHELL returns raw bytes or raw MCB/IVT/BDA regions. Rich decoding happens on the modern host.
 
 Address-space types:
 
@@ -955,6 +1213,8 @@ PHYS physical address
 PM selector:offset
 DPMI linear address
 ```
+
+Host-side bridge may expose richer tools to the AI, such as `mem.decode_bda`, but those are host-derived views over `mem.read` results.
 
 ---
 
@@ -1060,8 +1320,9 @@ Preferred split:
 AISHELL.EXE   real-mode shell/loader/resident core
 AICORE.EXE    32-bit DPMI protected-mode core
 AISHELL.CFG   policy/config
-AISHELL.OVL   optional overlays/help, later
 ```
+
+No overlay system is part of v1. Features must either fit in `AICORE.EXE` or move to the modern host. `AISHELL.OVL` is reserved only for a future version if overlays are deliberately designed up front, including segment layout, swap discipline, and state ownership.
 
 User-facing command remains `AISHELL`.
 
@@ -1088,6 +1349,8 @@ User-facing command remains `AISHELL`.
 ---
 
 ## 20. Roadmap
+
+The roadmap is deliberately divided into a shippable v1.0 and later polish. Scope discipline matters more than feature completeness.
 
 ### Phase 0 — REAL skeleton
 
@@ -1128,20 +1391,23 @@ User-facing command remains `AISHELL`.
 
 ### Phase 5 — AICORE RPC v1
 
+- HELLO capability negotiation.
 - Binary frame parser.
 - `system.info`.
 - `transport.status`.
 - `fs.list/stat/read/write`.
 - `console.read`.
 - `screen.text`.
+- mandatory timeouts/budgets in tool-call envelope.
 
 ### Phase 6 — Exec and co-pilot v1
 
-- `exec.run_command`.
+- `exec.run_command` with timeout.
 - command-entered events.
-- output/error events.
+- batched output/error events.
 - suggestion display.
 - F9/F8/Esc handling.
+- basic `console_owner` and policy gates.
 
 ### Phase 7 — IEEE 1284 data-plane integration
 
@@ -1150,29 +1416,50 @@ User-facing command remains `AISHELL`.
 - CRC32.
 - PS/2-supervised reset/recovery.
 
-### Phase 8 — Human/AI arbitration
+### v1.0 ship target
+
+Ship v1.0 at the end of Phase 7, including the minimal parts of Phase 8 required for safety:
 
 - `console_owner`.
-- job queue.
-- policy modes.
-- approval flow.
+- policy mode gates.
+- side-effect classes.
+- timeouts and byte budgets.
+- human takeover hotkey.
+- COMMAND.COM fallback.
+
+This is enough for a useful AI co-pilot:
+
+- inspect files,
+- upload/download files,
+- run commands,
+- capture output/screen,
+- receive suggestions,
+- recover transports.
+
+### Phase 8 — Human/AI arbitration polish, v1.1
+
+- fuller job queue.
+- richer approval flow.
+- remote-human mode polish.
 - command locks.
+- better policy persistence.
 
-### Phase 9 — Memory and diagnostics
+### Phase 9 — Memory and diagnostics, v1.2
 
-- `mem.read`.
-- `mem.map MCB`.
-- BDA/IVT decode.
+- `mem.read` improvements.
+- raw MCB/IVT/BDA capture.
+- host-side decoders.
 - transport diagnostics.
+- tiny event-log query UI.
 
-### Phase 10 — Optional enhancements
+### Phase 10 — Optional enhancements, v1.3+
 
 - Graphics snapshots.
 - ECP PIO.
 - ECP DMA.
 - Compression.
-- `fs.patch`.
-- richer build-error recognizers.
+- `fs.patch`, if still useful after host-side patching.
+- richer build-error recognizers on host side.
 - DPMI safe-mode refinements.
 
 ---
