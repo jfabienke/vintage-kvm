@@ -20,5 +20,5 @@ pub use block_source::{BlockSource, SliceBlob};
 pub use crc::{Crc16Engine, Crc32Engine, SoftwareCrc16Ccitt, SoftwareCrc32Reflected};
 pub use packet::{
     commands, crc16, crc32, decode, encode, DecodeError, EncodeError, IncomingPacket,
-    HEADER_LEN, MAX_PACKET, MAX_PAYLOAD, OVERHEAD, SOH, TRAILER_LEN, ETX,
+    OutgoingPacket, HEADER_LEN, MAX_PACKET, MAX_PAYLOAD, OVERHEAD, SOH, TRAILER_LEN, ETX,
 };

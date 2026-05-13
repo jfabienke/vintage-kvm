@@ -40,6 +40,42 @@ pub struct IncomingPacket {
     pub payload: Vec<u8, MAX_PAYLOAD>,
 }
 
+/// A packet produced by the protocol dispatcher, awaiting transport-side
+/// encoding and transmission. The transport assigns the wire byte position
+/// (encoding via `encode()`); SEQ is set by the dispatcher.
+#[derive(Debug, Clone)]
+pub struct OutgoingPacket {
+    pub cmd: u8,
+    pub seq: u8,
+    pub payload: Vec<u8, MAX_PAYLOAD>,
+}
+
+impl OutgoingPacket {
+    /// Construct from cmd + seq + payload slice. Returns `None` if the
+    /// payload is too large.
+    pub fn new(cmd: u8, seq: u8, payload_slice: &[u8]) -> Option<Self> {
+        if payload_slice.len() > MAX_PAYLOAD {
+            return None;
+        }
+        let mut payload = Vec::new();
+        payload.extend_from_slice(payload_slice).ok()?;
+        Some(Self { cmd, seq, payload })
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for OutgoingPacket {
+    fn format(&self, f: defmt::Formatter) {
+        defmt::write!(
+            f,
+            "OutgoingPacket {{ cmd=0x{:02X} seq={} payload={}B }}",
+            self.cmd,
+            self.seq,
+            self.payload.len()
+        );
+    }
+}
+
 #[cfg(feature = "defmt")]
 impl defmt::Format for IncomingPacket {
     fn format(&self, f: defmt::Formatter) {

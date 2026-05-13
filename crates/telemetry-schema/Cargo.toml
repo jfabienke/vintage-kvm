@@ -14,5 +14,5 @@ serde = ["dep:serde"]
 defmt = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 
-[dev-dependencies]
-serde_json = { workspace = true, features = ["alloc"] }
+# No serde_json dev-dep — host TUI parses JSON via its own
+# Deserialize-capable mirror (see lib.rs feature note).

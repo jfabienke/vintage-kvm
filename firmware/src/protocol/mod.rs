@@ -1,21 +1,20 @@
 //! Protocol dispatcher (firmware-side).
 //!
 //! Pure protocol logic (packet codec, CAP_RSP payload builder, block server,
-//! command IDs) lives in the `vintage-kvm-protocol` crate. This module is the
+//! command IDs) lives in `vintage-kvm-protocol`. This module is the
 //! firmware-specific glue: it wires the embedded Stage 2 blob into the
-//! protocol-side block server, owns the session state, and emits defmt
-//! diagnostics on every event.
+//! protocol-side block server, owns the session state, and emits telemetry
+//! events on every notable transition.
 
 pub mod stage_blobs;
 
-use defmt::{debug, info, warn};
-use heapless::Vec;
-
+use crate::telemetry::{Event, TelemetryEmit};
+use defmt::{debug, info};
 use vintage_kvm_protocol::{
     block_server::{BlockServer, RECV_MAX_PAYLOAD},
     cap::{build_cap_rsp_payload, ACTIVE_MODE_SPP, PAYLOAD_LEN as CAP_PAYLOAD_LEN},
-    encode, IncomingPacket, MAX_PACKET,
     packet::commands::*,
+    BlockSource, IncomingPacket, OutgoingPacket,
 };
 
 use stage_blobs::EmbeddedStage2;
@@ -66,20 +65,25 @@ impl Default for SessionState {
 
 /// Outcome of handling one incoming packet.
 pub enum DispatchOutcome {
-    /// Caller should send these bytes back to the host.
-    Reply(Vec<u8, MAX_PACKET>),
+    /// Caller should send this packet to the host via the active transport.
+    Reply(OutgoingPacket),
     /// No reply for this command.
     Silent,
-    /// Command was malformed or unknown; logged via defmt.
+    /// Command was malformed or unknown; observed via telemetry.
     Ignored,
 }
 
-pub fn handle_packet(p: &IncomingPacket, state: &mut SessionState) -> DispatchOutcome {
+pub fn handle_packet<T: TelemetryEmit>(
+    p: &IncomingPacket,
+    state: &mut SessionState,
+    telemetry: &T,
+) -> DispatchOutcome {
     if p.seq != state.rx_seq_expected {
-        warn!(
-            "seq gap: expected {}, got {} (cmd 0x{:02X})",
-            state.rx_seq_expected, p.seq, p.cmd
-        );
+        telemetry.emit(Event::SeqGap {
+            expected: state.rx_seq_expected,
+            got: p.seq,
+            cmd: p.cmd,
+        });
     }
     state.rx_seq_expected = p.seq.wrapping_add(1);
 
@@ -87,27 +91,24 @@ pub fn handle_packet(p: &IncomingPacket, state: &mut SessionState) -> DispatchOu
         CMD_CAP_REQ => handle_cap_req(p, state),
         CMD_CAP_ACK => handle_cap_ack(p, state),
         CMD_PING => handle_ping(p, state),
-        CMD_SEND_BLOCK => handle_send_block(p, state),
-        CMD_BLOCK_ACK => handle_block_ack(p, state),
-        CMD_BLOCK_NAK => handle_block_nak(p, state),
+        CMD_SEND_BLOCK => handle_send_block(p, state, telemetry),
+        CMD_BLOCK_ACK => handle_block_ack(p, state, telemetry),
+        CMD_BLOCK_NAK => handle_block_nak(),
         other => {
-            warn!("unknown cmd 0x{:02X}", other);
+            telemetry.emit(Event::UnknownCmd { cmd: other });
             DispatchOutcome::Ignored
         }
     }
 }
 
-fn handle_cap_req(p: &IncomingPacket, state: &mut SessionState) -> DispatchOutcome {
-    if !p.payload.is_empty() {
-        debug!("CAP_REQ has non-empty payload ({}); ignoring", p.payload.len());
-    }
+fn handle_cap_req(_p: &IncomingPacket, state: &mut SessionState) -> DispatchOutcome {
     info!("CAP_REQ received");
     // CAP_REQ resets the session as the bootstrap protocol contract.
     state.reset();
 
     let mut payload = [0u8; CAP_PAYLOAD_LEN];
     let n = build_cap_rsp_payload(&state.blob, ACTIVE_MODE_SPP, &mut payload);
-    encode_reply(CMD_CAP_RSP, state.next_seq(), &payload[..n])
+    build_reply(CMD_CAP_RSP, state.next_seq(), &payload[..n])
 }
 
 fn handle_cap_ack(_p: &IncomingPacket, state: &mut SessionState) -> DispatchOutcome {
@@ -118,57 +119,51 @@ fn handle_cap_ack(_p: &IncomingPacket, state: &mut SessionState) -> DispatchOutc
 
 fn handle_ping(p: &IncomingPacket, state: &mut SessionState) -> DispatchOutcome {
     debug!("PING ({} B payload)", p.payload.len());
-    encode_reply(CMD_PONG, state.next_seq(), &p.payload)
+    build_reply(CMD_PONG, state.next_seq(), &p.payload)
 }
 
-fn handle_send_block(p: &IncomingPacket, state: &mut SessionState) -> DispatchOutcome {
+fn handle_send_block<T: TelemetryEmit>(
+    p: &IncomingPacket,
+    state: &mut SessionState,
+    _telemetry: &T,
+) -> DispatchOutcome {
     let block_no = match BlockServer::parse_send_block(&p.payload) {
         Ok(n) => n,
-        Err(e) => {
-            warn!("SEND_BLOCK parse error: {}", e);
-            return DispatchOutcome::Ignored;
-        }
+        Err(_) => return DispatchOutcome::Ignored,
     };
-    if block_no != state.block_server.expected_block {
-        debug!(
-            "SEND_BLOCK out-of-order: got {}, expected {} (Stage 1 retry)",
-            block_no, state.block_server.expected_block
-        );
-    }
 
     let mut payload = [0u8; RECV_MAX_PAYLOAD];
-    let n = match state.block_server.build_recv_block(&state.blob, block_no, &mut payload) {
+    let n = match state
+        .block_server
+        .build_recv_block(&state.blob, block_no, &mut payload)
+    {
         Ok(n) => n,
-        Err(e) => {
-            warn!("RECV_BLOCK build error: {}", e);
-            return DispatchOutcome::Ignored;
-        }
+        Err(_) => return DispatchOutcome::Ignored,
     };
-    encode_reply(CMD_RECV_BLOCK, state.next_seq(), &payload[..n])
+    build_reply(CMD_RECV_BLOCK, state.next_seq(), &payload[..n])
 }
 
-fn handle_block_ack(p: &IncomingPacket, state: &mut SessionState) -> DispatchOutcome {
+fn handle_block_ack<T: TelemetryEmit>(
+    p: &IncomingPacket,
+    state: &mut SessionState,
+    telemetry: &T,
+) -> DispatchOutcome {
     state.block_server.handle_ack(&p.payload);
-    debug!("BLOCK_ACK; expected_block now {}", state.block_server.expected_block);
+    telemetry.emit(Event::BlockAck {
+        block_no: state.block_server.expected_block.saturating_sub(1),
+        running_crc32: state.blob.crc32(), // placeholder; sniffer-backed accumulator lands at Phase 5
+    });
     DispatchOutcome::Silent
 }
 
-fn handle_block_nak(_p: &IncomingPacket, _state: &mut SessionState) -> DispatchOutcome {
+fn handle_block_nak() -> DispatchOutcome {
     debug!("BLOCK_NAK; Stage 1 will SEND_BLOCK again");
     DispatchOutcome::Silent
 }
 
-fn encode_reply(cmd: u8, seq: u8, payload: &[u8]) -> DispatchOutcome {
-    let mut out = [0u8; MAX_PACKET];
-    match encode(cmd, seq, payload, &mut out) {
-        Ok(n) => {
-            let mut v: Vec<u8, MAX_PACKET> = Vec::new();
-            v.extend_from_slice(&out[..n]).ok();
-            DispatchOutcome::Reply(v)
-        }
-        Err(e) => {
-            warn!("encode failed: {}", e);
-            DispatchOutcome::Ignored
-        }
+fn build_reply(cmd: u8, seq: u8, payload: &[u8]) -> DispatchOutcome {
+    match OutgoingPacket::new(cmd, seq, payload) {
+        Some(p) => DispatchOutcome::Reply(p),
+        None => DispatchOutcome::Ignored,
     }
 }

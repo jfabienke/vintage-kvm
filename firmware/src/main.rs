@@ -1,31 +1,49 @@
 //! vintage-kvm firmware — Phase 3+ MVP.
 //!
-//! Serves Stage 1 v1.0 over the IEEE 1284 SPP-nibble bootstrap channel:
-//! CAP_REQ → CAP_RSP, PING → PONG, and SEND_BLOCK → RECV_BLOCK for the
-//! embedded Stage 2 placeholder.
+//! Serves DOS Stage 1 v1.0 over the IEEE 1284 SPP-nibble bootstrap channel:
+//! `CAP_REQ` → `CAP_RSP`, `PING` → `PONG`, and `SEND_BLOCK` → `RECV_BLOCK`
+//! for the embedded Stage 2 placeholder.
 //!
-//! Phase 0's GP7 red-LED blink is preserved as a heartbeat on a separate
-//! task, so a wedged protocol task is visible at a glance.
+//! Module layering follows `docs/firmware_crate_and_trait_design.md`:
 //!
-//! See `docs/pico_phase3_design.md` for design + bring-up sequence.
+//! ```text
+//! main         (this file: spawn tasks, wire layers)
+//!   │
+//!   ├── status::heartbeat            GP7 red-LED life indicator
+//!   │
+//!   └── serve_loop                   Phase-3 dispatcher loop
+//!         │
+//!         ├── transport::LptTransport<SppNibblePhy, DefmtEmit>
+//!         │     ├── lpt::compat::SppNibblePhy      (LptPhy impl)
+//!         │     └── transport::packet_stream::PacketReassembler
+//!         │
+//!         ├── protocol::SessionState
+//!         │     └── protocol::stage_blobs::EmbeddedStage2 (BlockSource impl)
+//!         │
+//!         └── telemetry::DefmtEmit                 (TelemetryEmit impl)
+//! ```
 
 #![no_std]
 #![no_main]
 
-use defmt::{info, warn};
+use defmt::info;
 use embassy_executor::Spawner;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
-use embassy_time::Timer;
 use {defmt_rtt as _, panic_probe as _};
 
 mod lifecycle;
 mod lpt;
-mod packet_stream;
 mod protocol;
+mod ps2;
+mod status;
+mod telemetry;
+mod transport;
+mod util;
 
 use lpt::compat::SppNibblePhy;
-use packet_stream::PacketReassembler;
 use protocol::{handle_packet, DispatchOutcome, SessionState};
+use telemetry::{DefmtEmit, Event, TelemetryEmit};
+use transport::{LptTransport, Transport};
 
 #[unsafe(link_section = ".bi_entries")]
 #[used]
@@ -38,11 +56,19 @@ pub static PICOTOOL_ENTRIES: [embassy_rp::binary_info::EntryAddr; 4] = [
     embassy_rp::binary_info::rp_program_build_attribute!(),
 ];
 
+const FW_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
-    info!("vintage-kvm: Phase 3 MVP starting");
+    // Telemetry sink lives for the whole program. DefmtEmit is zero-sized so
+    // we copy it freely into tasks that need to emit.
+    let telemetry = DefmtEmit;
+    telemetry.emit(Event::Boot {
+        fw_version: FW_VERSION,
+        phase: 3,
+    });
     info!(
         "stage2 placeholder: {} bytes, CRC-32 = 0x{:08X}",
         protocol::stage_blobs::STAGE2_SIZE,
@@ -51,7 +77,7 @@ async fn main(spawner: Spawner) {
 
     // GP7 = on-board red LED (status heartbeat).
     let led = Output::new(p.PIN_7, Level::Low);
-    spawner.spawn(heartbeat(led).expect("spawn heartbeat"));
+    spawner.spawn(status::heartbeat::run(led).expect("spawn heartbeat"));
 
     // LPT pin allocation per `docs/hardware_reference.md` §3.3 and
     // `docs/pico_phase3_design.md`. nInit (host strobe) routing TBD;
@@ -91,31 +117,27 @@ async fn main(spawner: Spawner) {
         phase,
     );
 
-    info!("LPT SPP-nibble phy ready; entering serve loop");
-    serve_loop(phy).await;
-}
+    let transport = LptTransport::new(phy, DefmtEmit);
 
-#[embassy_executor::task]
-async fn heartbeat(mut led: Output<'static>) {
-    loop {
-        led.set_high();
-        Timer::after_millis(50).await;
-        led.set_low();
-        Timer::after_millis(950).await;
-    }
+    info!("LPT SPP-nibble transport ready; entering serve loop");
+    serve_loop(transport).await;
 }
 
 /// Run forever: receive a packet, dispatch, send any reply, repeat.
 ///
 /// Phase 3 makes no attempt at recovery beyond what `PacketReassembler`
-/// already does (resync on bad SOH / CRC / ETX). Persistent timeouts /
-/// faults will surface as defmt warnings.
-async fn serve_loop(mut phy: SppNibblePhy) -> ! {
-    let mut reassembler = PacketReassembler::new();
+/// already does (resync on bad SOH / CRC / ETX). The telemetry stream is
+/// the diagnostic surface for unhealthy wires.
+async fn serve_loop<T: Transport>(mut transport: T) -> ! {
     let mut state = SessionState::new();
+    let telemetry = DefmtEmit;
 
     loop {
-        let pkt = reassembler.next_packet(&mut phy).await;
+        let pkt = match transport.recv_packet().await {
+            Ok(p) => p,
+            Err(_) => continue, // packet_stream already emitted a resync event
+        };
+
         info!(
             "rx cmd=0x{:02X} seq={} payload={}B",
             pkt.cmd,
@@ -123,17 +145,11 @@ async fn serve_loop(mut phy: SppNibblePhy) -> ! {
             pkt.payload.len()
         );
 
-        match handle_packet(&pkt, &mut state) {
-            DispatchOutcome::Reply(bytes) => {
-                for &b in bytes.iter() {
-                    if let Err(e) = phy.send_byte(b).await {
-                        warn!("LPT tx error: {}", e);
-                        break;
-                    }
-                }
+        match handle_packet(&pkt, &mut state, &telemetry) {
+            DispatchOutcome::Reply(out) => {
+                let _ = transport.send_packet(&out).await;
             }
-            DispatchOutcome::Silent => {}
-            DispatchOutcome::Ignored => {}
+            DispatchOutcome::Silent | DispatchOutcome::Ignored => {}
         }
     }
 }
