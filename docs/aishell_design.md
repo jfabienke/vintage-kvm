@@ -202,6 +202,8 @@ AISHELL REAL owns:
 - DPMI core launcher.
 - Safe fallback to COMMAND.COM.
 
+Panic / status output assumes a text-mode video state (color: `B800:0000`; mono: `B000:0000` based on BIOS data area at `0040:0049`). If a direct VRAM write isn't appropriate — for example, if the host was last in a graphics mode — REAL falls back to `INT 10h AH=0Eh` teletype output. REAL does not switch video modes on its own; that's an operator-or-AICORE concern.
+
 #### 5.1.3 REAL should not own
 
 AISHELL REAL should avoid:
@@ -513,6 +515,30 @@ struct ais_event_log_entry {
 ```
 
 The event log is intentionally tiny. Its purpose is crash forensics: after AICORE fails, the REAL shim can report the last N significant events.
+
+Canonical event-log IDs (distinct from the AI co-pilot events in §13.2 — those flow on the wire, these stay in the shared block):
+
+```c
+enum ais_el_id {
+    EL_BOOT             = 0x0001,
+    EL_RUNTIME_PROMOTED = 0x0002,   /* REAL -> DPMI launch */
+    EL_RUNTIME_DROPPED  = 0x0003,   /* DPMI -> REAL (AICORE exit) */
+    EL_POLICY_CHANGED   = 0x0004,
+    EL_TRANSPORT_RESET  = 0x0010,
+    EL_TRANSPORT_DOWNGRADE = 0x0011,
+    EL_RING_OVERFLOW    = 0x0020,   /* arg0 = channel, arg1 = bytes dropped */
+    EL_I8042_STUCK      = 0x0021,
+    EL_PIC_MASK_DRIFT   = 0x0022,
+    EL_LPT_STROBE_STALL = 0x0023,
+    EL_FOREIGN_IRQ      = 0x0024,
+    EL_REAL_FAULT       = 0x002F,   /* generic; arg0 = flag, arg1 = reason */
+    EL_EXEC_STARTED     = 0x0040,
+    EL_EXEC_FINISHED    = 0x0041,
+    EL_PANIC            = 0x00FF
+};
+```
+
+The `AIS_KBD_RING_SIZE`, `AIS_AUX_RING_SIZE`, `AIS_TX_RING_SIZE`, and `AIS_EVENT_LOG_SIZE` macros are compiled in at build time from the active profile (§8.2). A single build chooses one profile; multi-profile builds ship as separate `AISHELL.EXE` binaries rather than runtime-switchable.
 
 ### 8.2 Ring rules
 
@@ -1258,6 +1284,38 @@ Recovery prompt:
 AICORE stopped.
 [R]etry  [S]afe mode  [C]OMMAND.COM  [U]ninstall  [B]oot/reboot
 ```
+
+Policy persistence across an AICORE restart:
+
+- On `[R]etry`, AICORE restarts in `/POLICY=SAFE` regardless of the prior policy, unless `AISHELL.CFG` declares a `RECOVERY_POLICY=` override. SAFE is the default because the operator has not yet reaffirmed consent.
+- `AISHELL.CFG`'s baseline `POLICY=` value is used when AICORE is launched fresh (cold boot or `[R]etry` with `RECOVERY_POLICY=BASELINE`).
+- The shared block's `policy_state` field is updated only by AICORE; REAL never promotes policy on its own.
+
+### 17.4 REAL → AICORE error signaling
+
+The REAL shim signals upward through the shared block's `error_flags`, `last_error`, and `kick_flags` fields. AICORE polls these on each loop iteration alongside ring drains.
+
+Conditions REAL flags upward:
+
+- Ring overflow (per-channel bit in `error_flags`).
+- Sustained glitch / framing-error rate on the PS/2 side.
+- i8042 stuck-status (status register fails to clear over a bounded wait).
+- PIC mask drift (REAL observes a mask AISHELL didn't write).
+- LPT host-strobe stall (no strobe edge within expected window).
+- Foreign IRQ owner — another resident installed an IRQ1/IRQ12 hook after AISHELL.
+
+On any flag set, REAL:
+
+1. Writes the flag bit + a short reason code into `last_error`.
+2. Records a `EL_REAL_FAULT` event log entry with `event_id`, `arg0` = flag, `arg1` = sub-reason, and current `bios_ticks_seen` as timestamp.
+3. Sets `kick_flags` to wake AICORE on the next slice (no callback — AICORE will see it polling).
+
+AICORE response is policy-driven:
+
+- Soft errors (ring overflow, glitch rate) → emit `E_TRANSPORT_DEGRADED`, narrow budgets, continue.
+- Hard errors (i8042 stuck, mask drift, foreign IRQ owner) → transition to recovery mode, prompt the human.
+
+REAL never tears down on its own. The shim's contract is "stay alive, keep flagging" so AICORE or the operator decides next steps.
 
 ---
 
