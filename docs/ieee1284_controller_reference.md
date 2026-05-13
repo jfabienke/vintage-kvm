@@ -84,3 +84,4 @@ Atomic 7-register snapshot read is the chip's main efficiency win over per-regis
 - [`design.md`](design.md) — full merged design, especially §8 (IEEE 1284 negotiation and autodetection), §9 (packet format), §22 Phases 3–5 (LPT-side roadmap)
 - [`hardware_reference.md`](hardware_reference.md) — 74LVC161284 transceiver choice, GPIO map (8-bit data bus on HSTX connector GP12–GP19, control/status on GP11/GP20/GP22–GP27)
 - [`ps2_eras_reference.md`](ps2_eras_reference.md) — sibling reference for the PS/2 side; same pattern of "host-side code is the dual of what the Pico's device-side firmware must mirror"
+- [`stage1_design.md`](stage1_design.md) — Stage 1 is the first DOS-side consumer of this reference; it implements the controller side of the negotiation described here

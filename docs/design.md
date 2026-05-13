@@ -192,40 +192,40 @@ Functions:
 
 ```text
                               ┌─────────────────────────────────┐
-                              │      Modern Host PC (USB-C)      │
-                              │ Python / Rust / C# / Native App  │
+                              │      Modern Host PC (USB-C)     │
+                              │ Python / Rust / C# / Native App │
                               └────────────────┬────────────────┘
                                                │
                                                │ USB CDC ACM
                                                │ bulk-ish host stream
                                                ▼
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                         RP2350 Pico 2 / Pico1284                           ║
+║                         RP2350 Pico 2 / Pico1284                             ║
 ╟──────────────────────────────────────────────────────────────────────────────╢
-║ Application Layer                                                           ║
-║   Console / File / Screen / Memory / Command / Diagnostics                  ║
+║ Application Layer                                                            ║
+║   Console / File / Screen / Memory / Command / Diagnostics                   ║
 ║                                                                              ║
 ║ Compression Layer                                                            ║
-║   LZ4 / LZSS / Delta+RLE / RLE / raw fallback                               ║
+║   LZ4 / LZSS / Delta+RLE / RLE / raw fallback                                ║
 ║                                                                              ║
 ║ Packet Layer                                                                 ║
-║   [SOH CMD SEQ LEN PAYLOAD CRC-16 ETX]                                      ║
+║   [SOH CMD SEQ LEN PAYLOAD CRC-16 ETX]                                       ║
 ║                                                                              ║
 ║ Capability + Session Layer                                                   ║
-║   capability request/response/ack, traffic profiles, dictionaries           ║
+║   capability request/response/ack, traffic profiles, dictionaries            ║
 ║                                                                              ║
 ║ Data Plane                                                                   ║
-║   IEEE 1284 negotiation + ECP/EPP/SPP/Byte/Compatibility PIO + DMA          ║
+║   IEEE 1284 negotiation + ECP/EPP/SPP/Byte/Compatibility PIO + DMA           ║
 ║                                                                              ║
 ║ Bootstrap / Control Plane                                                    ║
-║   PS/2 keyboard endpoint, optional AUX endpoint, DEBUG bootstrap, fallback  ║
+║   PS/2 keyboard endpoint, optional AUX endpoint, DEBUG bootstrap, fallback   ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
              │                                              │
              │ IEEE 1284 DB-25                              │ PS/2 keyboard/AUX
              │ high-speed data plane                        │ bootstrap/fallback
              ▼                                              ▼
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                            Vintage DOS PC                                   ║
+║                            Vintage DOS PC                                    ║
 ╟──────────────────────────────────────────────────────────────────────────────╢
 ║ DOS Application / TSR                                                        ║
 ║   screen dump, file transfer, console, CLI, memory access                    ║
@@ -243,7 +243,7 @@ Functions:
 ║   port detection, ECP/EPP registers, negotiation, packet I/O                 ║
 ║                                                                              ║
 ║ PS/2 Bootstrap Layer                                                         ║
-║   BIOS/DOS keyboard input, DEBUG script, STAGE0, i8042 private mode         ║
+║   BIOS/DOS keyboard input, DEBUG script, STAGE0, i8042 private mode          ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 ```
 
@@ -440,6 +440,12 @@ IN reads actual line state
 ---
 
 ## 7. Bootstrapping Strategy
+
+> **Full Stage 0 design:** [`stage0_design.md`](stage0_design.md) — variant matrix (XT/AT/PS2), per-variant channels, i8042 mastery, LED-pattern unlock, AUX enable, hand-off ABI, size budgets, failure handling, testing strategy.
+>
+> **Full Stage 1 design:** [`stage1_design.md`](stage1_design.md) — hand-off ABI in from Stage 0, LPT chipset detection, IEEE 1284 negotiation, minimal capability handshake, Stage 2 download + EXEC, mode-A (LPT-up) and mode-B (PS/2-only) operation, size budget, failure handling.
+>
+> This section is the canonical short-form summary; the per-stage docs are the detailed references.
 
 ### 7.1 Bootstrap Ladder
 
@@ -1514,6 +1520,8 @@ only ROI/tile/progressive inspection is realistic
 
 ## 20. Firmware Architecture on Pico 2
 
+**Detailed design:** [`pico_firmware_design.md`](pico_firmware_design.md) expands this section into an implementable spec covering all phases (task model, PIO/SM allocation, memory map, per-module designs, lifecycle state machine, error recovery, build system).
+
 ### 20.1 Rust/Embassy Task Layout
 
 Suggested tasks:
@@ -1635,6 +1643,142 @@ tsr.c
     resident command handler if used
 ```
 
+### 21.3 CPU-Class Dispatch in Stage 2
+
+Stage 2 is a single binary (unlike Stage 0, which splits per i8042 era), but its hot loops are duplicated and runtime-dispatched on CPU class. Stage 2 carries an 8086 baseline plus a 386+ optimized path for the small set of CPU-bound modules. The 286 is skipped on purpose — see below.
+
+#### Why split
+
+The hot paths benefit from 386 ISA in measurable ways:
+
+| Module | Cost driver | 386+ speedup from |
+|---|---|---|
+| `screen_vesa.c` | Pixel copy / tile-diff over 8/16/24/32 bpp framebuffers | 2–3× via `rep movsd` (32-bit string ops) |
+| `screen_text.c` | 80×25 cell-diff scan | ~2× via `movzx` + 32-bit loop counters |
+| `compress_rle.asm/c` | RLE / Delta+RLE inner loop, optional LZ4 | 3–4× via 32-bit arithmetic + scaled-index addressing |
+| `crc.asm/c` (CRC-32) | Per-byte table lookup in a tight loop | 2–3× via 32-bit accumulator |
+
+The cold paths — packet framing, TSR install, command dispatch, file open/close, `INT 21h` hooks, LPT byte pump (LPT wire rate is the bottleneck, not CPU) — gain nothing from 386 ISA and stay shared.
+
+#### Why skip 286
+
+286 adds `pusha/popa`, `enter/leave`, `imul reg,imm`, `shr/shl reg,imm` (vs `,1` and `,cl`), and a few minor encodings. None of these move the needle on the hot paths above — all stay 16-bit. The real ISA jump is **8086 → 386**: 32-bit registers via `db 0x66` prefix in 16-bit code, 32-bit string ops, `movzx/movsx`, scaled addressing. Two dispatch paths cover ~95 % of the addressable performance with half the maintenance cost of three.
+
+A 286 running Stage 2 takes the 8086 dispatch path and pays the same penalty as XT. This is acceptable: 286 boxes are rare in practice and the absolute throughput numbers are still adequate for text-mode work.
+
+#### Build pattern
+
+Each hot file ships as two source files compiled with different CPU targets:
+
+```text
+compress_rle_8086.asm    NASM, 8086 baseline
+compress_rle_386.asm     NASM, 386 ISA (uses 32-bit ops, scaled addressing)
+
+crc_8086.asm             NASM, 8086 baseline
+crc_386.asm              NASM, 32-bit accumulator path
+
+screen_text_8086.c       Watcom, -0 (8086)
+screen_text_386.c        Watcom, -3 (386)
+
+screen_vesa_8086.c       Watcom, -0
+screen_vesa_386.c        Watcom, -3
+```
+
+All variants link into a single `PICO1284.COM` / `.EXE`. Function symbols are suffixed `_8086` and `_386` to avoid collision.
+
+#### Install-time CPU detection
+
+CPU class detected at TSR install time via the standard real-mode probe:
+
+```asm
+; Returns AL = 0 (8086), 2 (286), or 3 (386+) in cpu_class.
+detect_cpu:
+    pushf
+    pop  ax                  ; AX = FLAGS
+    mov  bx, ax              ; save original
+    or   ax, 0F000h          ; try to set bits 12-15
+    push ax
+    popf
+    pushf
+    pop  ax
+    and  ax, 0F000h
+    jz   .cpu_8086           ; 8086 forces bits 12-15 to 1; couldn't clear
+    cmp  ax, 0F000h
+    je   .check_386          ; 286+ retains them; check for 386
+    ; 286
+    mov  al, 2
+    jmp  .done
+.check_386:
+    ; try to clear bit 15 (NT flag is 286-cleared on push, 386-writeable)
+    mov  ax, bx
+    and  ax, 7FFFh           ; clear bit 15
+    push ax
+    popf
+    pushf
+    pop  ax
+    test ax, 8000h
+    jnz  .cpu_286            ; 286 forces bit 15 back to 1
+    mov  al, 3
+    jmp  .done
+.cpu_286:
+    mov  al, 2
+    jmp  .done
+.cpu_8086:
+    xor  al, al
+.done:
+    push bx
+    popf                     ; restore original FLAGS
+    ret
+```
+
+~30 bytes of code, runs once at install.
+
+#### Dispatch table
+
+Function pointers wired in `stage2_init` based on detected class:
+
+```c
+struct hot_dispatch {
+    void  (*rle_compress)(const u8 *src, size_t n, u8 *dst);
+    u32   (*crc32_buf)(u32 init, const u8 *buf, size_t n);
+    void  (*vesa_tile_diff)(const u32 *a, const u32 *b, u32 *diff_mask);
+    void  (*text_screen_diff)(const u16 *a, const u16 *b, u8 *cell_mask);
+};
+
+static struct hot_dispatch dispatch;
+
+void stage2_init(void) {
+    int cpu = detect_cpu_class();
+    if (cpu >= 3) {
+        dispatch.rle_compress     = rle_compress_386;
+        dispatch.crc32_buf        = crc32_buf_386;
+        dispatch.vesa_tile_diff   = vesa_tile_diff_386;
+        dispatch.text_screen_diff = text_screen_diff_386;
+    } else {
+        dispatch.rle_compress     = rle_compress_8086;
+        dispatch.crc32_buf        = crc32_buf_8086;
+        dispatch.vesa_tile_diff   = vesa_tile_diff_8086;
+        dispatch.text_screen_diff = text_screen_diff_8086;
+    }
+}
+```
+
+The function-pointer indirection costs one memory load + one indirect call per top-level invocation. Inner loops stay tight (the dispatch is outside the loop, not inside it), so the overhead is negligible compared to the 2–4× ISA gain.
+
+#### Binary-size impact
+
+Estimated bloat from duplicating four hot modules: ~5–10 KB on a Stage 2 expected to land around 50 KB total. Stage 2's delivery channel is LPT (or worst-case PS/2 nibble during a fallback session), so an extra 10 KB is sub-second on LPT and ~tens of seconds on PS/2 fallback — acceptable relative to the runtime wins.
+
+#### Asymmetry with Stage 0
+
+| Stage | Multiplicity | Axis | Constraint |
+|---|---|---|---|
+| Stage 0 | 3 binaries (XT/AT/PS2) | i8042 channel availability | Injection-time budget (~75 s/KB on XT) |
+| Stage 1 | 1 binary | runtime-detects channels via Stage 0's `DX` | Loader-only, cold-path code |
+| Stage 2 | 1 binary, 2 hot-path dispatches (8086 / 386) | CPU class | Steady-state CPU budget |
+
+Different constraints, different solutions. Stage 0 splits at the file level because keyboard-injection bandwidth is the binding cost. Stage 2 splits at the dispatch-table level because CPU is the binding cost and delivery is cheap.
+
 ---
 
 ## 22. Implementation Roadmap
@@ -1699,6 +1843,7 @@ tsr.c
 - Text diff.
 - CRC resync.
 - Host-side rendering.
+- **Both `_8086` and `_386` text-diff variants implemented and benchmarked** (§21.3). Performance target: 386 path measurably faster (~2×) on the same 80×25 buffer.
 
 ### Phase 8: DOS RLE/Delta+RLE
 
@@ -1706,6 +1851,7 @@ tsr.c
 - Pico decompression/recompression.
 - USB forwarding.
 - Performance measurement on target CPUs.
+- **Both `_8086` and `_386` RLE variants implemented**; per-CPU-class measurement validates the 3–4× dispatch gain (§21.3).
 
 ### Phase 9: VESA Capture
 
@@ -1715,6 +1861,7 @@ tsr.c
 - Tile diff.
 - 16/24/32 bpp support.
 - ROI/progressive refresh.
+- **Both `_8086` and `_386` tile-diff variants implemented**; 32-bit `rep movsd` path on 386+ shows the expected 2–3× speedup vs the 16-bit baseline (§21.3).
 
 ### Phase 10: Full TSR/CLI
 

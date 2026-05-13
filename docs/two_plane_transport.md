@@ -35,7 +35,7 @@ The Pico and DOS-side Stage 0 / pico1284 maintain **one logical vintage-kvm sess
   Control plane                      Data plane
   PS/2 KBD/AUX                       IEEE 1284 EPP/ECP
   low-rate, robust                   high-rate, bulk
-  IRQ1 / IRQ12                       LPT IRQ/poll/DMA-ish loops
+  IRQ1 / IRQ12                       polled PIO, optional ECP DMA
 ```
 
 **The control plane owns state. The data plane owns bytes.**
@@ -106,8 +106,9 @@ Use PS/2 as the negotiation coordinator:
 
 ```
 PS/2 control:
-  CP_CMD_1284_NEGOTIATE(mode=EPP preferred, fallback=ECP/SPP)
-  CP_EVT_1284_MODE(mode=EPP, width=8, crc=on)
+  CP_CMD_1284_NEGOTIATE(mode=EPP_PIO preferred, fallback=ECP_PIO/SPP_PIO,
+                        ECP_DMA opt-in if supports_ecp_dma=1 in dp_caps)
+  CP_EVT_1284_MODE(mode=EPP_PIO, width=8, crc=on)
   CP_EVT_1284_READY(data_channel_id=N)
 
 IEEE 1284 data:
@@ -728,7 +729,7 @@ On a slow DOS host, avoid making IEEE 1284 interrupt-driven even when the LPT ch
 - Two interrupt sources competing for the same slow CPU produces unpredictable timing.
 - The foreground polling loop already runs at a cadence that matches the LPT data rate fine.
 
-**Rule:** only the slow control path (PS/2) gets IRQ priority. The fast data path (IEEE 1284) is deliberately cooperative/polled.
+**Rule:** only the slow control path (PS/2) gets IRQ priority. The fast data path (IEEE 1284) is deliberately cooperative/polled. This rule applies to ECP DMA as well: DMA completion is **polled via terminal count / ECR status**, not signalled by an LPT IRQ. See [§Data-plane modes and optional ECP DMA](#data-plane-modes-and-optional-ecp-dma) below.
 
 ### Final design rule
 
@@ -737,6 +738,211 @@ On a slow DOS host, avoid making IEEE 1284 interrupt-driven even when the LPT ch
 > **IEEE 1284 moves bytes only in bounded slices.**
 
 This gives responsive abort/reset/control semantics without overwhelming 286/386-era machines or violating DOS reentrancy constraints.
+
+## Data-plane modes and optional ECP DMA
+
+The data plane is not a single transport — it is a small set of host-side LPT personalities with very different throughput, complexity, and reliability profiles. **PS/2 never uses DMA.** DMA is an **optional ECP acceleration mode**, not a baseline transport.
+
+### Mode set
+
+```c
+enum dp_mode {
+    DP_MODE_EPP_PIO   = 1,   // default fast path
+    DP_MODE_ECP_PIO   = 2,   // fallback if EPP unavailable but ECP works
+    DP_MODE_ECP_DMA   = 3,   // optional acceleration on validated hosts
+    DP_MODE_SPP_PIO   = 4,   // last-resort byte-at-a-time (compat / nibble)
+};
+```
+
+| Mode | DMA | Notes |
+|---|---|---|
+| `EPP_PIO` | No | Fast handshaked PIO. CPU-driven `in`/`out`/`outs` loops. Default. |
+| `ECP_PIO` | No | ECP FIFO drained by CPU. Useful when EPP isn't available but ECP is. |
+| `ECP_DMA` | Yes | ECP FIFO ↔ ISA DMA channel ↔ DOS bounce buffer. Opt-in, calibrated. |
+| `SPP_PIO` | No | Byte-at-a-time SPP / nibble. Rescue path only. |
+
+This list extends the ECR mode space from [`ieee1284_controller_reference.md`](ieee1284_controller_reference.md) (`ECR_SPP/PS2/PPF/ECP/EPP`) with an explicit PIO-vs-DMA dimension that is invisible to the peripheral side: from the Pico's wire view, `ECP_PIO` and `ECP_DMA` are both just ECP — only the host's transport implementation differs.
+
+### Why PS/2 has no DMA path
+
+PS/2 KBD/AUX bytes arrive through the i8042-compatible controller at port `0x60` with status at `0x64`, signalled by IRQ1 (KBD) and IRQ12 (AUX via `0xD4`). There is no PC DMA channel attached to the i8042 output buffer. PS/2 therefore stays IRQ-driven byte capture into a small ring buffer — which is fine, because PS/2 is the control/safety plane, not the bulk pipe. See [`ps2_eras_reference.md`](ps2_eras_reference.md) for the per-era resource table.
+
+### Why DMA is only plausible for ECP
+
+The parallel port has three broad personalities, and only one is DMA-friendly:
+
+| Mode | DMA suitability | Reason |
+|---|---|---|
+| SPP / compatibility | Poor | Byte-at-a-time programmed I/O, no FIFO. |
+| EPP | Usually poor | Fast PIO handshake; typically CPU-driven `in`/`out` loops. No standard DMA path. |
+| ECP | **Good candidate** | Designed with FIFO and optional DMA/IRQ support; the only mode that ISA DMA naturally fits. |
+
+So the useful DMA target is exactly:
+
+```
+ECP FIFO ↔ ISA DMA / chipset DMA ↔ DOS bounce buffer
+```
+
+### When DMA is worth it
+
+DMA helps for **larger, linear payloads** and hurts for small messages. Sizing thresholds (tune empirically):
+
+| Payload size | Mode |
+|---|---|
+| < 256 B | PIO (DMA setup dominates) |
+| 256 B – 2 KiB | Probably PIO unless CPU is very slow |
+| > 2–4 KiB | Consider ECP DMA |
+
+DMA helps:
+
+- Pico → host: screen deltas, file chunks, trace dumps, compressed logs, firmware/image chunks.
+- Host → Pico: larger command payloads, file uploads, firmware/update chunks, configuration blobs.
+
+DMA does **not** help (and adds risk) for: small commands, ACK/NAK, control messages, short register reads, PS/2 fallback traffic. Those stay PIO or PS/2.
+
+### DOS DMA constraints
+
+Classic PC DMA imposes constraints that the host driver must enforce — these are the dominant source of "works on my machine, breaks on clones" failures.
+
+**1. 64 KiB page boundary.** ISA DMA cannot cross a 64 KiB physical DMA page boundary in a single transfer. The bounce buffer must satisfy:
+
+```
+(physical_start & 0xFFFF) + length <= 0x10000
+```
+
+Safest strategy: allocate a dedicated bounce buffer (16 KiB or 32 KiB) at install time, aligned so it never crosses a 64 KiB DMA boundary, in conventional memory. Do not DMA directly into arbitrary XMS/protected-mode buffers — use the bounce and `memcpy` from foreground context.
+
+**2. DMA channel assignment.** ECP parallel ports historically use DMA 1 or DMA 3, but channel selection depends on BIOS/PnP/ECP configuration and clone-chipset behavior. Potential conflicts: DMA 1 with sound cards / 8-bit devices, DMA 3 sometimes claimed by other LPT/ECP or tape devices, DMA 5/6/7 are 16-bit and less relevant for classic 8-bit ECP FIFO paths. The driver must either read BIOS/PnP/ECP configuration, accept an operator-supplied channel at install, or probe conservatively — **never blindly assume a channel.**
+
+**3. Cache coherency on 486+ / Pentium.** Chipset behavior with ISA DMA and CPU caches varies. Conventional low memory is usually safe; arbitrary XMS / protected-mode buffers are not. The bounce-buffer strategy above also resolves this concern.
+
+**4. Transfer granularity.** DMA setup overhead is non-trivial on a 286/386. Honor the size thresholds in [§When DMA is worth it](#when-dma-is-worth-it) — do not DMA tiny frames.
+
+### Capability discovery and mode negotiation
+
+During data-plane setup, PS/2 control coordinates discovery and the Pico chooses the preferred mode after the host reports capability. Probe order:
+
+1. PS/2 control plane: `CP_CMD_LPT_PROBE_BEGIN`.
+2. Host probes LPT base candidates: `0x378`, `0x278`, `0x3BC`, plus BIOS Data Area entries.
+3. Host detects EPP/ECP capability via standard ECR/CTR probes ([`ieee1284_controller_reference.md`](ieee1284_controller_reference.md)).
+4. Host reports a `dp_caps` capability frame to the Pico.
+5. Pico selects preferred mode (typically `ECP_DMA` if reported and validated, else `EPP_PIO`).
+6. Host validates the chosen mode with a small calibration transfer.
+7. PS/2 commits the data-plane mode via `CP_DP_OPEN`.
+
+Capability frame:
+
+```c
+struct dp_caps {
+    uint16_t lpt_base;            // 0x378 / 0x278 / 0x3BC / ...
+    uint8_t  supports_spp     : 1;
+    uint8_t  supports_epp     : 1;
+    uint8_t  supports_ecp     : 1;
+    uint8_t  supports_ecp_dma : 1;
+    uint8_t  reserved         : 4;
+    uint8_t  irq;                 // LPT IRQ, or 0xFF if none/unknown
+    uint8_t  dma_channel;         // 0xFF if none/unknown
+    uint8_t  fifo_depth;          // ECP FIFO depth, if known
+    uint16_t max_dma_block;       // largest single DMA transfer the host will allow
+};
+```
+
+This extends, rather than replaces, the §10 capability handshake in [`design.md`](design.md): `dp_caps` is a data-plane-specific extension of the global capability blob, carried during `CP_CAPS_RSP`.
+
+### Control-plane integration of DMA state
+
+PS/2 owns DMA lifecycle. The data plane never decides on its own to start, stop, or recover a DMA transfer.
+
+```
+CP_DP_OPEN(mode=ECP_DMA, dma_ch=3, buf=phys_addr, len=N, max_block=4096)
+CP_DP_PAUSE
+CP_DP_RESUME
+CP_DP_RESET
+CP_DP_ERROR(code=DMA_TC_TIMEOUT | DMA_BOUNDARY_WRAP | ECP_FIFO_STUCK | ...)
+CP_DP_FALLBACK(mode=ECP_PIO | EPP_PIO | SPP_PIO)
+```
+
+Recovery semantics fall straight out of the existing rule that **only the PS/2 control plane changes `dp_state`** (see [§Runtime states for the data plane](#runtime-states-for-the-data-plane)). A DMA failure transitions `DP_ACTIVE → DP_STALLED` and PS/2 then either renegotiates the same mode, falls back to a lower mode, or degrades to PS/2-only.
+
+### Concurrency: keep the model, change only the pump
+
+ECP DMA does **not** change the [§DOS-side concurrency model](#dos-side-concurrency-model). It changes only the implementation of `pump_1284_budget(N)`:
+
+```c
+// PIO variant (EPP_PIO / ECP_PIO)
+void pump_1284_budget_pio(unsigned budget) {
+    while (budget > 0 && tx_has_bytes() && lpt_ready()) {
+        outb(lpt_data_port, tx_next_byte());
+        budget--;
+    }
+}
+
+// DMA variant (ECP_DMA)
+void pump_1284_budget_dma(unsigned budget) {
+    if (!dma_in_flight) {
+        size_t chunk = min3(budget, max_dma_block, tx_contig_bytes());
+        if (chunk == 0) return;
+        dma_program(chunk);     // program 8237, set ECR to ECP, kick FIFO
+        dma_in_flight = chunk;
+        return;                 // yield; foreground checks completion next slice
+    }
+    if (dma_terminal_count() || ecr_fifo_empty_after_drain()) {
+        tx_commit(dma_in_flight);
+        dma_in_flight = 0;
+    } else if (dma_deadline_expired()) {
+        signal_cp_dp_error(DMA_TC_TIMEOUT);
+        dma_in_flight = 0;
+    }
+}
+```
+
+Two invariants hold across both variants:
+
+1. **Bounded slices.** A DMA chunk is sized to the slice budget (and to `max_dma_block`), then the scheduler returns and re-checks PS/2 flags. A single transfer never monopolises the CPU.
+2. **Polled completion.** Terminal count and ECP status are polled — the LPT IRQ is **not** wired to an ISR. This preserves the "only PS/2 gets IRQ priority" rule above.
+
+Chunk sizing rules:
+
+- 4 KiB chunks on cautious hosts.
+- 8–16 KiB chunks on known-good 386/486+ (subject to `max_dma_block` from `dp_caps`).
+- **Never cross a 64 KiB DMA page boundary** inside a single transfer — split at the boundary instead.
+- Each chunk carries a `dp_frame` sequence number and CRC-32; PS/2 supervises chunk commit via `CP_DP_CHUNK_OK(seq)` or in-band ACK plus periodic PS/2 cross-check.
+
+### DMA failure modes and graceful degradation
+
+DMA adds failure modes that PIO does not have:
+
+- DMA terminal count never asserts (wrong channel, wrong direction, masked).
+- ECP FIFO underrun / overrun.
+- 64 KiB boundary wrap (driver bug; must not happen if allocator is correct).
+- Stale bounce-buffer contents.
+- Chipset advertises ECP but implements it badly.
+- Wrong DMA direction bit.
+
+Degradation ladder (PS/2 drives the transition each step):
+
+```
+ECP_DMA  →  ECP_PIO  →  EPP_PIO  →  SPP_PIO / nibble  →  PS2_ONLY
+```
+
+Do not spend much code attempting to salvage a broken DMA mode on unknown clone hardware. Two failed retries on the same mode is a strong signal to step down the ladder.
+
+### Architectural rule for DMA
+
+> **PS/2 never uses DMA.**  
+> **IEEE 1284 EPP defaults to bounded PIO.**  
+> **IEEE 1284 ECP may use DMA for large chunks after capability detection and validation.**  
+> **PS/2 remains the supervisor that can pause, reset, or downgrade the DMA data plane.**
+
+### Phased rollout
+
+DMA is not in the v1 transport. It comes in only after the PIO baseline is real and the control-plane recovery story is proven.
+
+| Phase | Modes supported | Notes |
+|---|---|---|
+| v1 | `EPP_PIO` + PS/2 control + `SPP_PIO` rescue | First end-to-end transport. No ECP work yet. |
+| v2 | adds `ECP_PIO` | FIFO-aware pump; validates ECP mode-transition contract from [`ieee1284_controller_reference.md`](ieee1284_controller_reference.md). |
+| v3 | adds `ECP_DMA` | Opt-in via `dp_caps`; calibrated per host. |
 
 ## Striping policy when IEEE 1284 is up
 
@@ -1002,6 +1208,11 @@ Two new firmware modules emerge from this architecture and should be added to [`
 11. **AUX ISR bounded-drain count:** default 16 bytes per IRQ12 invocation. Tune per CPU class — 286 may need 8, 486+ may tolerate 32. Empirical only.
 12. **Adaptive LPT slice sizing thresholds:** default high-water for AUX ring is 75% full and low-water is 0 fill for 5 cycles. Tune once real traffic is measured.
 13. **Detection of CPU class at TSR install time:** `pico1284` needs to pick slice/buffer sizes per host. Options: BIOS CPU detect, timing loop calibration, or operator-supplied flag at install. Lean toward CPU detect with timing-loop calibration override.
+14. **ECP DMA channel discovery:** read BIOS/PnP/ECP configuration, accept an operator-supplied flag at install, or conservative probe? Default proposal: read PnP/ECP config when present, fall back to operator flag, never auto-probe a channel. See [§DOS DMA constraints](#dos-dma-constraints).
+15. **ECP DMA bounce-buffer sizing:** 16 KiB vs 32 KiB conventional-memory allocation at TSR install. Default proposal: 16 KiB on 286/386, 32 KiB on 486+, both aligned so no 64 KiB DMA page boundary is crossed.
+16. **DMA-vs-PIO crossover threshold:** payload size at which `ECP_DMA` beats `ECP_PIO`. Default proposal: 2 KiB, but tune per host class once measured. Below crossover, even an `ECP_DMA`-capable session uses PIO for the chunk.
+17. **DMA mode-downgrade hysteresis:** how many `ECP_DMA` failures before stepping to `ECP_PIO`? Default proposal: 2 consecutive failures on the same chunk, or any boundary-wrap or wrong-channel error (immediate downgrade).
+18. **`max_dma_block` policy:** capped by `dp_caps.max_dma_block`, but should the Pico further cap it by available `dp_rx_ring` space? Default proposal: yes — never DMA more bytes than the consumer can drain in one slice budget cycle.
 
 ## Related documents
 
@@ -1010,3 +1221,5 @@ Two new firmware modules emerge from this architecture and should be added to [`
 - [`ieee1284_controller_reference.md`](ieee1284_controller_reference.md) — IEEE 1284 controller-side reference; the L0/L1 of the data plane
 - [`ps2_eras_reference.md`](ps2_eras_reference.md) — per-era PS/2 capabilities (XT keyboard-only, AT keyboard bidir, PS/2+SuperIO adds AUX)
 - [`implementation_plan.md`](implementation_plan.md) — per-subrepo plan (firmware modules, DOS modules)
+- [`stage0_design.md`](stage0_design.md) — Stage 0 brings the data plane up and hands off via fixed register ABI; this doc describes the session that runs after that hand-off
+- [`stage1_design.md`](stage1_design.md) — Stage 1 takes Stage 0's hand-off, negotiates IEEE 1284, and downloads Stage 2; this doc is the protocol Stage 2 then enters

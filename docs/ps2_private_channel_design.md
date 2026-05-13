@@ -367,3 +367,4 @@ The host driver's mouse handler is bypassed entirely because vintage-kvm owns IR
 - [`ps2_eras_reference.md`](ps2_eras_reference.md) — per-era protocol differences, Super I/O catalog
 - [`hardware_reference.md`](hardware_reference.md) §3 — PS/2 hardware (74LVC07A buffer, GPIO map)
 - [`implementation_plan.md`](implementation_plan.md) §1 — firmware module breakdown including `ps2/private_mode.rs`
+- [`stage0_design.md`](stage0_design.md) — Stage 0 brings the private channel up via the LED-pattern unlock + AUX 200/100/80 knock described here

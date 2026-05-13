@@ -36,11 +36,13 @@ Two PIO programs cover all eras (already foreshadowed by `No0ne/ps2pico` shippin
 
 ## Per-era DOS Stage 0 changes
 
+> **Full Stage 0 design:** [`stage0_design.md`](stage0_design.md). This table is the era-aware summary; the design doc covers per-variant size budgets, hand-off ABI, LED-pattern unlock, AUX enable, and failure handling.
+
 | Stage 0 file | Target era | Channels available | What's new |
 |---|---|---|---|
 | `dos/stage0/s0_xt.asm` *(exists)* | XT, 8088/8086 | LPT (nibble bidir), keyboard (input-only typing of DEBUG script) | — (already correct; XT has no i8042 to master) |
-| `dos/stage0/s0_at.asm` *(new)* | AT, 286+ | LPT + **i8042 keyboard port** (bidirectional via §7.4 LED-pattern unlock) | i8042 mastery: mask IRQ1 at PIC, flush 0x60, send `0xED`+mask sequence, verify Pico private-mode response, then bidirectional byte exchange via 0x60/0x64 |
-| `dos/stage0/s0_ps2.asm` *(new)* | PS/2 + SuperIO, 386+ | LPT + i8042 keyboard + **i8042 AUX (mouse)** for dual-lane fallback transport | Adds AUX channel via `0xD4` command prefix and IRQ12 handling — this is what enables `docs/design.md` §17 dual-lane fallback |
+| `dos/stage0/s0_at.asm` *(exists)* | AT, 286+ | LPT + **i8042 keyboard port** (bidirectional via §7.4 LED-pattern unlock) | i8042 mastery: mask IRQ1 at PIC, flush 0x60, send `0xED`+mask sequence, verify Pico private-mode response, then bidirectional byte exchange via 0x60/0x64 |
+| `dos/stage0/s0_ps2.asm` *(exists)* | PS/2 + SuperIO, 386+ | LPT + i8042 keyboard + **i8042 AUX (mouse)** for dual-lane fallback transport | Adds AUX channel via `0xD4` command prefix and IRQ12 masking — this is what enables `docs/design.md` §17 dual-lane fallback |
 
 **System detection at boot:**
 - BIOS data area `0040:0010` (equipment word) and `INT 11h` indicate mouse/PS/2 presence.
@@ -190,7 +192,7 @@ The `_PRS` (possible resource settings) is a single fixed dependent function wit
 - **`SUPERIO_KBC_PS2M`** — mouse shares the same Logical Device Number (LDN) as the keyboard. Two IRQs come out of one LDN. Common pattern on older Winbond parts.
 - **`SUPERIO_KBC_PS2LDN`** — mouse has its own independently-configurable LDN. Enables clean enable/disable of AUX without touching KBD. Used by ITE IT87xx and similar.
 
-**Implication for vintage-kvm:** the §17 dual-lane fallback doesn't care which AUX architecture the host uses — both lanes are active by default and Stage 0 just hooks IRQ1 + IRQ12. The distinction matters only if Stage 0 wants to **disable** one lane without affecting the other (e.g., bring AUX down for diagnostics while keyboard stays live). On PS2M chips that requires extra care because disabling the LDN takes both lanes.
+**Implication for vintage-kvm:** the §17 dual-lane fallback doesn't care which AUX architecture the host uses — both lanes are active by default and Stage 0 masks IRQ1 + IRQ12 while it owns the controller, then Stage 1 installs any handlers it needs before unmasking. The distinction matters only if Stage 0 wants to **disable** one lane without affecting the other (e.g., bring AUX down for diagnostics while keyboard stays live). On PS2M chips that requires extra care because disabling the LDN takes both lanes.
 
 #### References
 
@@ -206,7 +208,7 @@ Only universal SuperIO-specific concern for vintage-kvm Stage 0 is **A20 gate** 
 ## How to apply
 
 - **Pico firmware structure:** two PIO programs (`ps2_xt_dev.pio` for XT-class hosts, `ps2_at_dev.pio` for AT/PS/2/SuperIO). Rust state machines layered on top: `ps2_kbd_state.rs` (BAT, ACK, LED-set unlock detector, typematic), `ps2_mouse_state.rs` (3-byte packets + IntelliMouse 4-byte mode unlock). Host class chosen by config GPIO or persisted flash flag, mirroring `No0ne/ps2pico`'s separate-UF2 model.
-- **DOS Stage 0 variants:** keep `s0_xt.asm` as-is (LPT-only, correct for XT). Add `s0_at.asm` with i8042 mastery via the pattern above. Add `s0_ps2.asm` extending `s0_at` with AUX channel for `docs/design.md` §17 dual-lane fallback. SuperIO uses `s0_ps2.asm` unchanged.
+- **DOS Stage 0 variants:** keep `s0_xt.asm` as-is (LPT-only, correct for XT). `s0_at.asm` adds i8042 mastery via the pattern above. `s0_ps2.asm` extends the AT path with AUX channel support for `docs/design.md` §17 dual-lane fallback. SuperIO uses `s0_ps2.asm` unchanged.
 - **§7.4 LED-pattern unlock works on AT+, never on XT** — XT keyboard line is hardware-unidirectional. On XT, the bidirectional channel is exclusively LPT (which is what `s0_xt.asm` already implements).
 - **Scancode set choice:** emit Set 2 from AT/PS/2/SuperIO; 8042's translate mode (CCB bit 6) handles software that expects Set 1. Emit Set 1 from XT (no choice — XT keyboards only speak Set 1).
 - **System detection at boot:** BIOS data area `0040:0010` + `INT 11h` for mouse presence; probe port `0x64` for XT-vs-AT discrimination; probe AUX (`OUT 64h, 0A8h`) for AT-vs-PS/2.
@@ -215,5 +217,6 @@ Only universal SuperIO-specific concern for vintage-kvm Stage 0 is **A20 gate** 
 ## Related documents
 
 - [`design.md`](design.md) — full merged design (packet format, capability handshake, compression, VESA, roadmap phases 0–11)
+- [`stage0_design.md`](stage0_design.md) — detailed design for the three Stage 0 variants referenced in this table
 - [`hardware_reference.md`](hardware_reference.md) — Feather pinout, 74LVC07A PS/2 buffer, 74LVC161284 IEEE 1284 transceiver, BOM
 - [`ieee1284_controller_reference.md`](ieee1284_controller_reference.md) — sibling reference for the parallel-port side (Linux `uss720.c` + `parport/ieee1284.c`); same pattern of "controller-side code is the dual of what the Pico's peripheral must mirror"

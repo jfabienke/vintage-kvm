@@ -57,20 +57,6 @@ STAGE1_LOAD_OFF   equ 0800h
 MAX_STAGE1_SIZE   equ 50000
 BLOCK_SIZE        equ 64
 
-; LPT register offsets
-LPT_DATA          equ 0
-LPT_STATUS        equ 1
-LPT_CONTROL       equ 2
-
-; Control register bits as written to base+2.
-; INIT is used as the host strobe.
-CTRL_INIT         equ 04h
-CTRL_BASE         equ 0Ch
-
-; Status bits
-STAT_NIBBLE_MASK  equ 78h
-STAT_PHASE        equ 80h
-
 ; Stage0 wire commands
 CMD_PROBE0        equ 050h        ; 'P'
 CMD_PROBE1        equ 031h        ; '1'
@@ -89,14 +75,17 @@ RSP_OK1           equ 04Bh        ; 'K'
 ; Retry/timeout tuning
 PROBE_RETRIES     equ 3
 BLOCK_RETRIES     equ 5
-TIMEOUT_OUTER     equ 0FFFFh
-TIMEOUT_INNER     equ 0010h
 
 ; Delay tuning.
 ; DELAY_COUNT=200 is intentionally conservative for 4.77 MHz XT-class
 ; machines and slow/marginal parallel-port glue logic. Stage1 can negotiate
-; faster timing later.
+; faster timing later. Consumed by tiny_delay in lpt_nibble.inc.
 DELAY_COUNT       equ 200
+
+; LPT register layout, control/status bits, nibble timeouts, and the
+; init/send/recv/delay routines now live in the shared include. The
+; include is brought in at the end of code, after start: (see below),
+; so the entry point remains at offset 0x100.
 
 ; ---------------------------------------------------------------------------
 ; COM entry
@@ -141,12 +130,17 @@ start:
     ;   AX = 'P1' marker
     ;   BX = selected LPT base
     ;   CX = Stage1 size
-    ;   DX = Stage0 kind: 0003h = XT_LPT_BOOTSTRAP
+    ;   DX = channel-availability bitmap reflecting channels actually up:
+    ;        bit 0 (0x01) = LPT channel up
+    ;        bit 1 (0x02) = i8042 KBD private channel up (never on XT)
+    ;        bit 2 (0x04) = i8042 AUX private channel up (never on XT)
+    ;   On XT only bit 0 is achievable. If LPT probe fails we exit to DOS
+    ;   before reaching this hand-off, so DX=0001h is always correct here.
     ;   DS = ES = CS
     mov ax, 3150h
     mov bx, [lpt_base]
     mov cx, [stage1_size]
-    mov dx, 0003h
+    mov dx, 0001h
     push cs
     pop ds
     push cs
@@ -215,13 +209,7 @@ find_pico_lpt:
     stc
     ret
 
-init_lpt_control:
-    mov dx, [lpt_base]
-    add dx, LPT_CONTROL
-    mov al, CTRL_BASE
-    out dx, al
-    call tiny_delay
-    ret
+; init_lpt_control now lives in stage0/lpt_nibble.inc (included below).
 
 probe_pico:
     mov al, CMD_PROBE0
@@ -285,11 +273,28 @@ get_stage1_meta:
     ret
 
 check_stage1_size:
+    ; Validate stage1_size and cross-check stage1_blocks == ceil(size/BLOCK_SIZE).
+    ; A bad/corrupted metadata response must not be allowed to drive
+    ; download_stage1's block-indexed writes past the intended image region;
+    ; without this check, a forged stage1_blocks would let block_no * 64 walk
+    ; over the PSP or Stage 0's own code before checksum failure.
     mov ax, [stage1_size]
     or ax, ax
     jz .bad
     cmp ax, MAX_STAGE1_SIZE
     ja .bad
+
+    ; expected_blocks = (stage1_size + BLOCK_SIZE - 1) / BLOCK_SIZE
+    add ax, BLOCK_SIZE - 1
+    jc  .bad                    ; overflow guard
+    mov cx, 6                   ; log2(BLOCK_SIZE) = log2(64) = 6
+.shr_loop:
+    shr ax, 1
+    loop .shr_loop
+
+    cmp ax, [stage1_blocks]
+    jne .bad
+
     clc
     ret
 
@@ -372,13 +377,28 @@ receive_current_block:
     cmp al, BLOCK_SIZE
     ja .fail
 
-    ; Destination = STAGE1_LOAD_OFF + current_block * BLOCK_SIZE
+    ; Bound check: block_offset + block_len must not exceed stage1_size.
+    ; Without this, a forged final-block payload_len could let stosb write
+    ; past the intended image region into PSP/code memory before the whole-
+    ; image checksum has a chance to reject it.
     mov ax, [current_block]
     mov bx, BLOCK_SIZE
     mul bx
     or dx, dx
-    jnz .fail
+    jnz .fail                   ; offset >= 64 KiB: impossible inside .COM
 
+    mov bx, ax                  ; bx = block_offset_in_image (bytes)
+    xor ah, ah
+    mov al, [block_len]
+    add bx, ax                  ; bx = block_offset + block_len
+    jc  .fail                   ; wrapped past 64 KiB
+    cmp bx, [stage1_size]
+    ja  .fail                   ; would write past end of image
+
+    ; Destination = STAGE1_LOAD_OFF + current_block * BLOCK_SIZE
+    mov ax, [current_block]
+    mov bx, BLOCK_SIZE
+    mul bx
     add ax, STAGE1_LOAD_OFF
     mov di, ax
 
@@ -451,139 +471,10 @@ verify_image_checksum:
     ret
 
 ; ---------------------------------------------------------------------------
-; LPT byte I/O
+; LPT byte I/O moved to stage0/lpt_nibble.inc; the %include below brings in
+; init_lpt_control, lpt_send_byte, lpt_recv_byte, lpt_recv_nibble, tiny_delay,
+; and tiny_delay_short.
 ; ---------------------------------------------------------------------------
-
-lpt_send_byte:
-    ; AL = byte to send.
-    ; Write byte to DATA, then toggle INIT as strobe.
-    push ax
-    push dx
-
-    mov dx, [lpt_base]
-    add dx, LPT_DATA
-    out dx, al
-    call tiny_delay
-
-    mov dx, [lpt_base]
-    add dx, LPT_CONTROL
-
-    mov al, CTRL_BASE ^ CTRL_INIT
-    out dx, al
-    call tiny_delay
-
-    mov al, CTRL_BASE
-    out dx, al
-    call tiny_delay
-
-    pop dx
-    pop ax
-    ret
-
-lpt_recv_byte:
-    ; Return:
-    ;   CF clear, AL = received byte
-    ;   CF set on timeout
-    push bx
-
-    call lpt_recv_nibble
-    jc .fail
-    mov bl, al                  ; low nibble
-
-    call lpt_recv_nibble
-    jc .fail
-    shl al, 4
-    or al, bl
-
-    clc
-    pop bx
-    ret
-
-.fail:
-    stc
-    pop bx
-    ret
-
-lpt_recv_nibble:
-    ; Wait for Pico phase bit to toggle, debounce/stabilize the status register,
-    ; then read nibble from status bits 3..6.
-    ;
-    ; Pico-side expectation:
-    ;   - Present nibble on logical status bits 3..6.
-    ;   - Toggle logical status bit 7 after nibble is stable.
-    ;   - Keep nibble stable until the DOS host consumes it.
-    ;
-    ; Returns AL = nibble 0..15.
-    push bx
-    push cx
-    push dx
-
-    mov dx, [lpt_base]
-    add dx, LPT_STATUS
-
-    in al, dx
-    and al, STAT_PHASE
-    mov bl, al                  ; previous phase
-
-    mov cx, TIMEOUT_OUTER
-
-.wait_outer:
-    push cx
-    mov cx, TIMEOUT_INNER
-
-.wait_inner:
-    in al, dx
-    mov ah, al
-    and ah, STAT_PHASE
-    cmp ah, bl
-    jne .candidate_phase
-    loop .wait_inner
-
-    pop cx
-    loop .wait_outer
-
-    stc
-    jmp .done
-
-.candidate_phase:
-    ; Debounce/stability check:
-    ; read the status register again after a very short delay. Accept only if
-    ; the phase bit is still changed and the full status byte is stable enough
-    ; for the nibble read.
-    mov bh, al
-    call tiny_delay_short
-    in al, dx
-    mov ah, al
-    and ah, STAT_PHASE
-    cmp ah, bl
-    je .continue_waiting
-
-    ; Prefer the second stable-ish sample for the nibble.
-    pop cx                      ; balance pushed outer counter
-
-    and al, STAT_NIBBLE_MASK
-    shr al, 3
-    and al, 0Fh
-
-    clc
-    jmp .done
-
-.continue_waiting:
-    ; Phase bounced or was not stable. Continue waiting within the same outer
-    ; timeout budget.
-    mov al, bh
-    loop .wait_inner
-
-    pop cx
-    loop .wait_outer
-
-    stc
-
-.done:
-    pop dx
-    pop cx
-    pop bx
-    ret
 
 send_u16:
     ; AX little-endian
@@ -717,23 +608,11 @@ print_hex_digit:
     pop dx
     ret
 
-tiny_delay:
-    push cx
-    mov cx, DELAY_COUNT
+; ---------------------------------------------------------------------------
+; Shared LPT SPP nibble byte pump (constants, routines, lpt_base, last_phase)
+; ---------------------------------------------------------------------------
 
-.loop:
-    loop .loop
-    pop cx
-    ret
-
-tiny_delay_short:
-    push cx
-    mov cx, 12
-
-.loop:
-    loop .loop
-    pop cx
-    ret
+%include "stage0/lpt_nibble.inc"
 
 ; ---------------------------------------------------------------------------
 ; Data
@@ -745,7 +624,6 @@ lpt_candidates:
     dw 0278h
     dw 0000h
 
-lpt_base:           dw 0000h
 stage1_size:        dw 0000h
 stage1_blocks:      dw 0000h
 stage1_sum16:       dw 0000h
