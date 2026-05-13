@@ -57,7 +57,7 @@ use defmt::trace;
 use embassy_rp::gpio::{Input, Level, Output};
 use embassy_time::Timer;
 
-use super::LptError;
+use super::{LptError, LptMode, LptPhy};
 
 /// Nibble-output pin (status[3] = nFault, LSB of nibble).
 pub type NibbleBit0 = Output<'static>;
@@ -166,6 +166,20 @@ impl SppNibblePhy {
         self.nibble_bits.1.set_level(level_from_bit(nibble, 1));
         self.nibble_bits.2.set_level(level_from_bit(nibble, 2));
         self.nibble_bits.3.set_level(level_from_bit(nibble, 3));
+    }
+}
+
+impl LptPhy for SppNibblePhy {
+    async fn recv_byte(&mut self) -> Result<u8, LptError> {
+        SppNibblePhy::recv_byte(self).await
+    }
+
+    async fn send_byte(&mut self, b: u8) -> Result<(), LptError> {
+        SppNibblePhy::send_byte(self, b).await
+    }
+
+    fn current_mode(&self) -> LptMode {
+        LptMode::SppNibble
     }
 }
 

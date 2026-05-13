@@ -40,6 +40,7 @@ pub struct IncomingPacket {
     pub payload: Vec<u8, MAX_PAYLOAD>,
 }
 
+#[cfg(feature = "defmt")]
 impl defmt::Format for IncomingPacket {
     fn format(&self, f: defmt::Formatter) {
         defmt::write!(
@@ -52,7 +53,8 @@ impl defmt::Format for IncomingPacket {
     }
 }
 
-#[derive(Debug, Clone, defmt::Format)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum DecodeError {
     TooShort,
     BadSoh,
@@ -60,6 +62,13 @@ pub enum DecodeError {
     BadEtx,
     BadCrc,
     PayloadOverflow,
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum EncodeError {
+    PayloadOverflow,
+    OutputTooSmall,
 }
 
 /// Decode a complete wire packet. `buf.len()` must equal the framed packet
@@ -97,7 +106,6 @@ pub fn decode(buf: &[u8]) -> Result<IncomingPacket, DecodeError> {
     let cmd = buf[1];
     let seq = buf[2];
     let mut payload: Vec<u8, MAX_PAYLOAD> = Vec::new();
-    // payload_len <= MAX_PAYLOAD checked above
     payload
         .extend_from_slice(&buf[HEADER_LEN..HEADER_LEN + payload_len])
         .ok();
@@ -136,12 +144,6 @@ pub fn encode(
     out[crc_end + 2] = ETX;
 
     Ok(total)
-}
-
-#[derive(Debug, Clone, defmt::Format)]
-pub enum EncodeError {
-    PayloadOverflow,
-    OutputTooSmall,
 }
 
 #[cfg(test)]

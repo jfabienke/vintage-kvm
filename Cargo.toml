@@ -1,10 +1,24 @@
 [workspace]
 resolver = "3"
-members = ["firmware"]
+members = [
+    "crates/protocol",
+    "crates/signatures",
+    "crates/telemetry-schema",
+    "firmware",
+]
 
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+# Shared deps used across both the firmware (no_std cortex-m) and the
+# pure-logic shared crates. Specific feature flags are picked per consumer.
+[workspace.dependencies]
+defmt = "1.0.1"
+heapless = { version = "0.8", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { version = "1", default-features = false }
 
 [profile.release]
 codegen-units = 1

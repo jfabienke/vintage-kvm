@@ -1,8 +1,8 @@
 //! Stage 2 block server.
 //!
-//! Serves `STAGE2_PLACEHOLDER` to DOS Stage 1 via the
-//! `SEND_BLOCK` → `RECV_BLOCK` → `BLOCK_ACK` / `BLOCK_NAK` protocol defined in
-//! `dos/stage1/stage1.asm:231-251`.
+//! Serves a `BlockSource` to the host (DOS Stage 1) via the
+//! `SEND_BLOCK` → `RECV_BLOCK` → `BLOCK_ACK` / `BLOCK_NAK` protocol defined
+//! in `dos/stage1/stage1.asm:231-251`.
 //!
 //! Per-block flow:
 //!
@@ -15,7 +15,7 @@
 //!              BLOCK_NAK     payload = u32 block_no (BE)     (retry)
 //! ```
 
-use crate::protocol::stage_blobs::stage2_block;
+use crate::block_source::BlockSource;
 
 pub const BLOCK_SIZE: usize = 64;
 
@@ -25,7 +25,8 @@ pub const RECV_HDR_LEN: usize = 5;
 /// Maximum `RECV_BLOCK` payload length (5 B header + up to 64 B data).
 pub const RECV_MAX_PAYLOAD: usize = RECV_HDR_LEN + BLOCK_SIZE;
 
-#[derive(Debug, Clone, defmt::Format)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum BlockError {
     BadRequestPayload,
     BlockOutOfRange,
@@ -34,7 +35,8 @@ pub enum BlockError {
 /// Server-side per-session state. Tracks which block Stage 1 is expected to
 /// request next so we can log out-of-order requests without rejecting them
 /// (Stage 1's retry logic re-sends the same block_no on NAK).
-#[derive(Default, Debug, defmt::Format)]
+#[derive(Default, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct BlockServer {
     pub expected_block: u16,
 }
@@ -61,17 +63,19 @@ impl BlockServer {
         Ok(u16::from_be_bytes([payload[2], payload[3]]))
     }
 
-    /// Build `RECV_BLOCK` payload for `block_no`. Returns the byte count
-    /// written into `out`, or `Err(BlockOutOfRange)` if the block is past
-    /// end-of-image.
-    pub fn build_recv_block(
+    /// Build `RECV_BLOCK` payload for `block_no` from `blob`. Returns the
+    /// byte count written into `out`, or `Err(BlockOutOfRange)` if the
+    /// block is past end-of-image.
+    pub fn build_recv_block<B: BlockSource>(
         &self,
+        blob: &B,
         block_no: u16,
         out: &mut [u8],
     ) -> Result<usize, BlockError> {
         debug_assert!(out.len() >= RECV_MAX_PAYLOAD);
 
-        let (data, count) = stage2_block(block_no, BLOCK_SIZE)
+        let (data, count) = blob
+            .block(block_no, BLOCK_SIZE)
             .ok_or(BlockError::BlockOutOfRange)?;
 
         let bn = block_no as u32;
@@ -94,7 +98,14 @@ impl BlockServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::stage_blobs::STAGE2_SIZE;
+    use crate::block_source::SliceBlob;
+    use crate::packet::crc32;
+
+    static TEST_BLOB: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+
+    fn blob() -> SliceBlob {
+        SliceBlob::new(TEST_BLOB, crc32::compute(TEST_BLOB))
+    }
 
     #[test]
     fn parses_block_no_be() {
@@ -117,21 +128,20 @@ mod tests {
     }
 
     #[test]
-    fn first_block_contains_entire_placeholder() {
+    fn first_block_contains_entire_short_blob() {
         let server = BlockServer::new();
         let mut buf = [0u8; RECV_MAX_PAYLOAD];
-        let n = server.build_recv_block(0, &mut buf).unwrap();
-        assert_eq!(n, RECV_HDR_LEN + STAGE2_SIZE);
-        // Echoed block_no = 0
-        assert_eq!(&buf[..4], &[0, 0, 0, 0]);
-        assert_eq!(buf[4] as usize, STAGE2_SIZE);
+        let n = server.build_recv_block(&blob(), 0, &mut buf).unwrap();
+        assert_eq!(n, RECV_HDR_LEN + TEST_BLOB.len());
+        assert_eq!(&buf[..4], &[0, 0, 0, 0]); // echoed block_no = 0
+        assert_eq!(buf[4] as usize, TEST_BLOB.len());
     }
 
     #[test]
     fn out_of_range_block_errors() {
         let server = BlockServer::new();
         let mut buf = [0u8; RECV_MAX_PAYLOAD];
-        assert!(server.build_recv_block(1, &mut buf).is_err());
+        assert!(server.build_recv_block(&blob(), 1, &mut buf).is_err());
     }
 
     #[test]

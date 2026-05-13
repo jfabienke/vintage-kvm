@@ -7,7 +7,7 @@
 - Architecture: [`design.md`](design.md), [`two_plane_transport.md`](two_plane_transport.md)
 - Hardware: [`hardware_reference.md`](hardware_reference.md), [`ieee1284_controller_reference.md`](ieee1284_controller_reference.md), [`ps2_eras_reference.md`](ps2_eras_reference.md), [`ps2_private_channel_design.md`](ps2_private_channel_design.md)
 - DOS side: [`stage0_design.md`](stage0_design.md), [`stage1_design.md`](stage1_design.md), [`stage1_implementation.md`](stage1_implementation.md)
-- Pico side: [`pico_firmware_design.md`](pico_firmware_design.md), [`pico_phase3_design.md`](pico_phase3_design.md), [`pio_state_machines_design.md`](pio_state_machines_design.md), [`instrumentation_surface.md`](instrumentation_surface.md)
+- Pico side: [`pico_firmware_design.md`](pico_firmware_design.md), [`pico_phase3_design.md`](pico_phase3_design.md), [`pio_state_machines_design.md`](pio_state_machines_design.md), [`instrumentation_surface.md`](instrumentation_surface.md), [`firmware_crate_and_trait_design.md`](firmware_crate_and_trait_design.md)
 
 This document is the per-subrepo execution plan that complements the architecture in [`design.md`](design.md). For each subrepo (existing or planned), it specifies directory layout, build pipeline, module responsibilities, phase mapping, and open decisions.
 
@@ -182,6 +182,8 @@ Single binary that runs on the Adafruit Feather RP2350 HSTX + 8 MB PSRAM, bridgi
 **Phase 3+ MVP slice (currently built):** [`pico_phase3_design.md`](pico_phase3_design.md).
 
 **Operator-facing instrumentation surface:** [`instrumentation_surface.md`](instrumentation_surface.md) (console formats, TUI dashboard, CDC telemetry JSON protocol, signature DB).
+
+**Crate workspace structure + trait taxonomy:** [`firmware_crate_and_trait_design.md`](firmware_crate_and_trait_design.md) — `crates/{protocol,telemetry-schema,signatures}` shared host+device, `firmware/` cortex-m bin. Five-layer trait stack: phy → protocol → transport → session → telemetry.
 
 ### Directory layout (target state)
 

@@ -11,8 +11,13 @@
 //! The placeholder is small (well under 64 B = 1 download block) so the
 //! Stage 1 → Stage 2 path exercises the *single-block* corner of the
 //! block server, including the last-block-short case.
+//!
+//! This module wraps the embedded blob in a `BlockSource` impl (defined in
+//! the `vintage-kvm-protocol` crate) so the protocol-side block server is
+//! generic over the source.
 
-use crate::packet::crc32;
+use vintage_kvm_protocol::block_source::BlockSource;
+use vintage_kvm_protocol::packet::crc32;
 
 /// Stage 2 placeholder: prints "PICO1284 Stage 2 placeholder v0.1\r\n" and
 /// exits with errorlevel 0.
@@ -42,45 +47,52 @@ pub static STAGE2_PLACEHOLDER: &[u8] = &[
     b'l', b'd', b'e', b'r', b' ', b'v', b'0', b'.', b'1', b'\r', b'\n', b'$',
 ];
 
-/// CRC-32/IEEE of `STAGE2_PLACEHOLDER`. Re-computed at startup to confirm
-/// the constant matches the blob (catches build-time tampering / drift).
+pub const STAGE2_SIZE: usize = STAGE2_PLACEHOLDER.len();
+
+/// Re-computed at startup to confirm the embedded blob's CRC matches the
+/// declared value. Replaces the v1-style separate `stage2_crc32()` accessor.
 pub fn stage2_crc32() -> u32 {
     crc32::compute(STAGE2_PLACEHOLDER)
 }
 
-pub const STAGE2_SIZE: usize = STAGE2_PLACEHOLDER.len();
-
-/// Block accessor used by the block server. `block_no` is 0-indexed.
-/// Returns `(data, byte_count)` where `byte_count ≤ 64`; the last block
-/// may be short.
-pub fn stage2_block(block_no: u16, block_size: usize) -> Option<(&'static [u8], u8)> {
-    let start = (block_no as usize).checked_mul(block_size)?;
-    if start >= STAGE2_SIZE {
-        return None;
-    }
-    let end = core::cmp::min(start + block_size, STAGE2_SIZE);
-    let slice = &STAGE2_PLACEHOLDER[start..end];
-    Some((slice, slice.len() as u8))
+/// Concrete `BlockSource` for the embedded Stage 2 placeholder.
+///
+/// CRC is computed once at construction so the trait's `crc32()` call is
+/// free at serve time.
+pub struct EmbeddedStage2 {
+    crc: u32,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+impl EmbeddedStage2 {
+    pub fn new() -> Self {
+        Self {
+            crc: stage2_crc32(),
+        }
+    }
+}
 
-    #[test]
-    fn placeholder_is_small_enough_to_be_one_block() {
-        assert!(STAGE2_SIZE <= 64);
+impl Default for EmbeddedStage2 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BlockSource for EmbeddedStage2 {
+    fn total_size(&self) -> usize {
+        STAGE2_SIZE
     }
 
-    #[test]
-    fn single_block_round_trip() {
-        let (data, n) = stage2_block(0, 64).unwrap();
-        assert_eq!(n as usize, STAGE2_SIZE);
-        assert_eq!(data, STAGE2_PLACEHOLDER);
+    fn crc32(&self) -> u32 {
+        self.crc
     }
 
-    #[test]
-    fn beyond_last_block_returns_none() {
-        assert!(stage2_block(1, 64).is_none());
+    fn block(&self, block_no: u16, block_size: usize) -> Option<(&[u8], u8)> {
+        let start = (block_no as usize).checked_mul(block_size)?;
+        if start >= STAGE2_SIZE {
+            return None;
+        }
+        let end = core::cmp::min(start + block_size, STAGE2_SIZE);
+        let slice = &STAGE2_PLACEHOLDER[start..end];
+        Some((slice, slice.len() as u8))
     }
 }

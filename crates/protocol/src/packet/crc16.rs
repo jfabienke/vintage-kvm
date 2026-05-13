@@ -2,12 +2,14 @@
 //!
 //! Byte-for-byte equivalent of `dos/stage1/stage1.asm:705` (`crc16_ccitt`).
 //! Bit-by-bit; suitable for small packet headers / payloads at SPP-nibble
-//! data rates. A table-driven variant is trivial to add later if Phase 5+
-//! line rates demand it.
+//! data rates. The DMA-sniffer hardware variant (`SnifferCrc16Ccitt`)
+//! implements the same `Crc16Engine` trait — see `crate::crc`.
 
 pub const POLY: u16 = 0x1021;
 pub const INIT: u16 = 0xFFFF;
 
+/// Compute CRC-16-CCITT over `buf`. Convenience wrapper around the trait;
+/// suitable for one-shot use over short slices.
 pub fn compute(buf: &[u8]) -> u16 {
     let mut crc: u16 = INIT;
     for &b in buf {

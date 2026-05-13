@@ -1,0 +1,15 @@
+[package]
+name = "vintage-kvm-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "vintage-kvm wire protocol: packet codec, CRC engines, command dispatch — no_std + no_alloc, runs on host and cortex-m"
+
+[features]
+default = []
+# Enable `defmt::Format` derives on public types (for embedded logging).
+defmt = ["dep:defmt"]
+
+[dependencies]
+heapless = { workspace = true }
+defmt = { workspace = true, optional = true }

@@ -27,9 +27,13 @@ embassy-time = { version = "0.5.1", features = [
 embassy-sync = { version = "0.8.0", features = ["defmt"] }
 embassy-futures = "0.1.2"
 
-heapless = { version = "0.8", default-features = false }
+heapless = { workspace = true }
 
-defmt = "1.0.1"
+vintage-kvm-protocol = { path = "../crates/protocol", features = ["defmt"] }
+vintage-kvm-telemetry-schema = { path = "../crates/telemetry-schema", features = ["defmt", "serde"] }
+vintage-kvm-signatures = { path = "../crates/signatures", features = ["defmt"] }
+
+defmt = { workspace = true }
 defmt-rtt = "1.0.0"
 panic-probe = { version = "1.0.0", features = ["print-defmt"] }
 

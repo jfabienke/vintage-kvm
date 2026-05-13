@@ -1,0 +1,15 @@
+[package]
+name = "vintage-kvm-signatures"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "vintage-kvm keyboard/chipset signature database + match algorithm. no_std; runs on host and cortex-m."
+
+[features]
+default = []
+defmt = ["dep:defmt"]
+serde = ["dep:serde"]
+
+[dependencies]
+defmt = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }

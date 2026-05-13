@@ -2,14 +2,15 @@
 //! xor-out 0xFFFFFFFF.
 //!
 //! Byte-for-byte equivalent of `dos/stage1/stage1.asm:1692` (`crc32_*`).
-//! Used in two places:
-//!  - `build.rs` computes the embedded Stage 2 blob's CRC-32 at build time.
-//!  - The firmware re-computes it (or asserts the constant) for diagnostics.
+//! The DMA-sniffer hardware variant implements the same `Crc32Engine`
+//! trait — see `crate::crc`.
 
 pub const POLY: u32 = 0xEDB88320;
 pub const INIT: u32 = 0xFFFFFFFF;
 pub const XOROUT: u32 = 0xFFFFFFFF;
 
+/// Compute CRC-32 over `buf`. Convenience wrapper around the trait;
+/// suitable for one-shot use over short slices.
 pub fn compute(buf: &[u8]) -> u32 {
     let mut state: u32 = INIT;
     for &b in buf {

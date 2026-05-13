@@ -11,12 +11,14 @@ fw-release = "build -p vintage-kvm-firmware --target thumbv8m.main-none-eabihf -
 fw-run     = "run   -p vintage-kvm-firmware --target thumbv8m.main-none-eabihf --release"
 fw-check   = "check -p vintage-kvm-firmware --target thumbv8m.main-none-eabihf"
 
-# Canonical from-root verification. Use these instead of `cargo test --workspace`,
-# which currently fails because the only workspace member is the cortex-m-only
-# firmware crate (no host-buildable tests exist yet). When host-targetable
-# crates land (e.g. host/, tools/), expand `ci` and `test-all` to include them.
-ci         = "fw-check"
-test-all   = "fw-check"
+# Host-side tests for the pure-logic shared crates. These build for the host
+# triple and exercise CRC vectors, packet round-trips, BlockSource adapters.
+host-test  = "test --workspace --exclude vintage-kvm-firmware"
+
+# Canonical from-root verification: host-side tests AND firmware type-check.
+# Use this before pushing.
+ci         = "host-test"
+test-all   = "host-test"
 
 [target.thumbv8m.main-none-eabihf]
 runner = "probe-rs run --chip RP235x"

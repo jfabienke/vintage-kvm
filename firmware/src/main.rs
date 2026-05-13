@@ -20,7 +20,6 @@ use {defmt_rtt as _, panic_probe as _};
 
 mod lifecycle;
 mod lpt;
-mod packet;
 mod packet_stream;
 mod protocol;
 

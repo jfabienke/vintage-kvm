@@ -11,7 +11,9 @@
 use defmt::{debug, warn};
 
 use crate::lpt::compat::SppNibblePhy;
-use crate::packet::{decode, DecodeError, IncomingPacket, HEADER_LEN, MAX_PACKET, SOH};
+use vintage_kvm_protocol::{
+    decode, DecodeError, IncomingPacket, HEADER_LEN, MAX_PACKET, SOH,
+};
 
 pub struct PacketReassembler {
     /// Working buffer for the currently-accumulating frame.

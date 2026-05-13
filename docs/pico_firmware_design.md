@@ -625,7 +625,7 @@ Per-state aggregations are computed in the consumer, not the producer, to keep e
 
 ```
 0x2000_0000  ┌──────────────────────────────────┐
-             │ .text in SRAM (cache-resident     │  ~32 KB
+             │ .text in SRAM (cache-resident    │  ~32 KB
              │ critical paths only; rest in     │
              │ flash XIP)                       │
              ├──────────────────────────────────┤
@@ -931,6 +931,7 @@ Phase 3 is the immediate scope. Phase 4-5 unblock Stage 1's auto-downgrade ladde
 - [`pico_phase3_design.md`](pico_phase3_design.md) — Phase 3+ MVP implementation slice
 - [`pio_state_machines_design.md`](pio_state_machines_design.md) — PIO program designs for every PS/2 and LPT mode
 - [`instrumentation_surface.md`](instrumentation_surface.md) — console formats, TUI dashboard, CDC telemetry protocol, signature DB
+- [`firmware_crate_and_trait_design.md`](firmware_crate_and_trait_design.md) — workspace crate split + trait taxonomy across phy/protocol/transport/session/telemetry layers
 - [`hardware_reference.md`](hardware_reference.md) — pin allocation
 - [`ieee1284_controller_reference.md`](ieee1284_controller_reference.md) — controller-side dual
 - [`ps2_eras_reference.md`](ps2_eras_reference.md) — PS/2 era / framing differences

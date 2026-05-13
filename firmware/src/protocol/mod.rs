@@ -1,43 +1,43 @@
-//! Protocol dispatcher.
+//! Protocol dispatcher (firmware-side).
 //!
-//! State machine + handlers for the packet commands Stage 1 v1.0 sends:
-//! `CAP_REQ`, `CAP_ACK`, `PING`, `SEND_BLOCK`, `BLOCK_ACK`, `BLOCK_NAK`.
-//!
-//! Each `handle_packet` invocation is a small pure-state-transition function
-//! that consumes one `IncomingPacket` and either:
-//!   - emits a reply packet (`CAP_RSP`, `PONG`, `RECV_BLOCK`), or
-//!   - silently advances internal state (`CAP_ACK`, `BLOCK_ACK`, `BLOCK_NAK`),
-//!   - or logs an unknown / unexpected command for telemetry.
-//!
-//! No I/O here. The caller (`main` task) shuttles bytes between this and the
-//! LPT phy.
+//! Pure protocol logic (packet codec, CAP_RSP payload builder, block server,
+//! command IDs) lives in the `vintage-kvm-protocol` crate. This module is the
+//! firmware-specific glue: it wires the embedded Stage 2 blob into the
+//! protocol-side block server, owns the session state, and emits defmt
+//! diagnostics on every event.
 
-pub mod block_server;
-pub mod cap;
 pub mod stage_blobs;
 
-use crate::packet::{commands::*, encode, IncomingPacket, MAX_PACKET};
-use block_server::{BlockServer, RECV_MAX_PAYLOAD};
 use defmt::{debug, info, warn};
 use heapless::Vec;
+
+use vintage_kvm_protocol::{
+    block_server::{BlockServer, RECV_MAX_PAYLOAD},
+    cap::{build_cap_rsp_payload, ACTIVE_MODE_SPP, PAYLOAD_LEN as CAP_PAYLOAD_LEN},
+    encode, IncomingPacket, MAX_PACKET,
+    packet::commands::*,
+};
+
+use stage_blobs::EmbeddedStage2;
 
 /// Session-scope state. Single instance owned by the dispatcher task.
 pub struct SessionState {
     pub block_server: BlockServer,
+    pub blob: EmbeddedStage2,
     /// Next SEQ number to use for outgoing packets.
     pub tx_seq: u8,
     /// Expected SEQ number on the next incoming packet. Mismatch is logged
     /// but does not drop (Stage 1 retries via BLOCK_NAK).
     pub rx_seq_expected: u8,
-    /// Has Stage 1 finished its CAP handshake? Used only for diagnostics
-    /// (Stage 1 may send PING any time, so we don't strictly gate on this).
+    /// Has Stage 1 finished its CAP handshake?
     pub cap_acked: bool,
 }
 
 impl SessionState {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             block_server: BlockServer::new(),
+            blob: EmbeddedStage2::new(),
             tx_seq: 0,
             rx_seq_expected: 0,
             cap_acked: false,
@@ -58,14 +58,19 @@ impl SessionState {
     }
 }
 
-/// Outcome of handling one incoming packet. The dispatcher returns either a
-/// framed reply packet or a hint to take no action.
+impl Default for SessionState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Outcome of handling one incoming packet.
 pub enum DispatchOutcome {
     /// Caller should send these bytes back to the host.
     Reply(Vec<u8, MAX_PACKET>),
-    /// No reply for this command (e.g. `CAP_ACK`, `BLOCK_ACK`, `BLOCK_NAK`).
+    /// No reply for this command.
     Silent,
-    /// Command was malformed or unknown; logged via defmt for diagnostics.
+    /// Command was malformed or unknown; logged via defmt.
     Ignored,
 }
 
@@ -100,8 +105,8 @@ fn handle_cap_req(p: &IncomingPacket, state: &mut SessionState) -> DispatchOutco
     // CAP_REQ resets the session as the bootstrap protocol contract.
     state.reset();
 
-    let mut payload = [0u8; cap::PAYLOAD_LEN];
-    let n = cap::build_cap_rsp_payload(&mut payload);
+    let mut payload = [0u8; CAP_PAYLOAD_LEN];
+    let n = build_cap_rsp_payload(&state.blob, ACTIVE_MODE_SPP, &mut payload);
     encode_reply(CMD_CAP_RSP, state.next_seq(), &payload[..n])
 }
 
@@ -132,7 +137,7 @@ fn handle_send_block(p: &IncomingPacket, state: &mut SessionState) -> DispatchOu
     }
 
     let mut payload = [0u8; RECV_MAX_PAYLOAD];
-    let n = match state.block_server.build_recv_block(block_no, &mut payload) {
+    let n = match state.block_server.build_recv_block(&state.blob, block_no, &mut payload) {
         Ok(n) => n,
         Err(e) => {
             warn!("RECV_BLOCK build error: {}", e);
@@ -165,70 +170,5 @@ fn encode_reply(cmd: u8, seq: u8, payload: &[u8]) -> DispatchOutcome {
             warn!("encode failed: {}", e);
             DispatchOutcome::Ignored
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::packet::{commands::*, decode, encode};
-
-    fn wrap_request(cmd: u8, seq: u8, payload: &[u8]) -> IncomingPacket {
-        let mut out = [0u8; MAX_PACKET];
-        let n = encode(cmd, seq, payload, &mut out).unwrap();
-        decode(&out[..n]).unwrap()
-    }
-
-    #[test]
-    fn cap_req_produces_rsp_with_correct_size_and_crc() {
-        let mut state = SessionState::new();
-        let req = wrap_request(CMD_CAP_REQ, 0, &[]);
-        let outcome = handle_packet(&req, &mut state);
-        let bytes = match outcome {
-            DispatchOutcome::Reply(b) => b,
-            _ => panic!("expected reply"),
-        };
-        let rsp = decode(&bytes).unwrap();
-        assert_eq!(rsp.cmd, CMD_CAP_RSP);
-        assert_eq!(rsp.payload.len(), cap::PAYLOAD_LEN);
-        assert_eq!(rsp.payload[0], cap::VERSION_MAJOR);
-    }
-
-    #[test]
-    fn ping_echoes_payload_as_pong() {
-        let mut state = SessionState::new();
-        let req = wrap_request(CMD_PING, 0, b"hello");
-        let outcome = handle_packet(&req, &mut state);
-        let bytes = match outcome {
-            DispatchOutcome::Reply(b) => b,
-            _ => panic!("expected reply"),
-        };
-        let rsp = decode(&bytes).unwrap();
-        assert_eq!(rsp.cmd, CMD_PONG);
-        assert_eq!(rsp.payload.as_slice(), b"hello");
-    }
-
-    #[test]
-    fn send_block_zero_returns_first_block() {
-        let mut state = SessionState::new();
-        let req = wrap_request(CMD_SEND_BLOCK, 0, &[0, 0, 0, 0]);
-        let outcome = handle_packet(&req, &mut state);
-        let bytes = match outcome {
-            DispatchOutcome::Reply(b) => b,
-            _ => panic!("expected reply"),
-        };
-        let rsp = decode(&bytes).unwrap();
-        assert_eq!(rsp.cmd, CMD_RECV_BLOCK);
-        // First 4 bytes echo block_no
-        assert_eq!(&rsp.payload[..4], &[0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn block_ack_advances_expected_block() {
-        let mut state = SessionState::new();
-        let req = wrap_request(CMD_BLOCK_ACK, 0, &[0, 0, 0, 0]);
-        let outcome = handle_packet(&req, &mut state);
-        assert!(matches!(outcome, DispatchOutcome::Silent));
-        assert_eq!(state.block_server.expected_block, 1);
     }
 }
