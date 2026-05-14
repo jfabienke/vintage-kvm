@@ -20,6 +20,14 @@
 #![allow(dead_code)] // Phase 1 scaffold; concrete impls are placeholders.
 
 pub mod oversampler;
+pub mod tx_kbd;
+
+// Single PIO1 IRQ binding shared by both PIO1 state machines (oversampler
+// on SM0, KBD TX on SM1). embassy's bind_interrupts! disallows re-binding
+// from multiple sites.
+embassy_rp::bind_interrupts!(pub(crate) struct Pio1Irqs {
+    PIO1_IRQ_0 => embassy_rp::pio::InterruptHandler<embassy_rp::peripherals::PIO1>;
+});
 
 #[allow(unused_imports)] // FrameTiming re-exported for downstream consumers
 pub use vintage_kvm_ps2_framer::{Framer, FrameTiming, Ps2Frame};

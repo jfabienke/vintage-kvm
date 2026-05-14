@@ -15,20 +15,14 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use embassy_rp::Peri;
-use embassy_rp::bind_interrupts;
-use embassy_rp::peripherals::{PIN_2, PIN_3, PIN_4, PIO1};
+use embassy_rp::peripherals::PIO1;
 use embassy_rp::pio::{
-    Common, Config, FifoJoin, InterruptHandler, LoadedProgram, Pio, ShiftConfig, ShiftDirection,
+    Common, Config, FifoJoin, LoadedProgram, Pin, ShiftConfig, ShiftDirection, StateMachine,
 };
 use fixed::types::U24F8;
 
 use super::Framer;
 use vintage_kvm_ps2_framer::{Classifier, ClassifierEvent};
-
-bind_interrupts!(struct Irqs {
-    PIO1_IRQ_0 => InterruptHandler<PIO1>;
-});
 
 /// Number of 3-bit samples packed into one RX-FIFO word. 10 × 3 = 30 bits,
 /// matching the autopush threshold; the top 2 bits of each word are zero.
@@ -112,52 +106,56 @@ fn clk_toggled_in_word(word: u32) -> bool {
     false
 }
 
-/// Spawn target — owns PIO1 SM0 + GP2/3/4 and runs forever, draining
-/// oversampled words into stats counters.
+pub struct KbdOversampler {
+    sm0: StateMachine<'static, PIO1, 0>,
+}
+
+impl KbdOversampler {
+    /// Configure PIO1 SM0 to run the oversampler program. Pins are passed
+    /// by reference so the caller can reuse GP3 (CLK_PULL) for the TX SM
+    /// without re-claiming the Peri handle.
+    pub fn new(
+        common: &mut Common<'static, PIO1>,
+        mut sm0: StateMachine<'static, PIO1, 0>,
+        clk_in: &Pin<'static, PIO1>,
+        clk_pull: &Pin<'static, PIO1>,
+        data_in: &Pin<'static, PIO1>,
+    ) -> Self {
+        let program = KbdOversampleProgram::new(common);
+
+        let mut cfg = Config::default();
+        cfg.use_program(&program.prg, &[]);
+        // IN_BASE = GP2; width 3 → reads GP2, GP3, GP4.
+        cfg.set_in_pins(&[clk_in, clk_pull, data_in]);
+
+        let clock_freq = U24F8::from_num(embassy_rp::clocks::clk_sys_freq());
+        cfg.clock_divider = clock_freq / U24F8::from_num(PIO_CLK_HZ);
+
+        cfg.fifo_join = FifoJoin::RxOnly;
+        cfg.shift_in = ShiftConfig {
+            auto_fill: true,
+            threshold: 30,
+            direction: ShiftDirection::Right,
+        };
+
+        sm0.set_config(&cfg);
+        sm0.set_enable(true);
+
+        defmt::info!(
+            "ps2 kbd oversampler armed: PIO1 SM0, GP2/3/4, {} MHz / {} = {} kHz sample",
+            embassy_rp::clocks::clk_sys_freq() / 1_000_000,
+            cfg.clock_divider.to_num::<f32>(),
+            PIO_CLK_HZ / 1000,
+        );
+
+        Self { sm0 }
+    }
+}
+
+/// Spawn target — drains oversampled words forever, feeding the framer +
+/// classifier and updating stats counters.
 #[embassy_executor::task]
-pub async fn run(
-    pio: Peri<'static, PIO1>,
-    clk_in: Peri<'static, PIN_2>,
-    clk_pull: Peri<'static, PIN_3>,
-    data_in: Peri<'static, PIN_4>,
-) {
-    let Pio {
-        mut common,
-        mut sm0,
-        ..
-    } = Pio::new(pio, Irqs);
-
-    let clk_in_pin = common.make_pio_pin(clk_in);
-    let clk_pull_pin = common.make_pio_pin(clk_pull);
-    let data_in_pin = common.make_pio_pin(data_in);
-
-    let program = KbdOversampleProgram::new(&mut common);
-
-    let mut cfg = Config::default();
-    cfg.use_program(&program.prg, &[]);
-    // IN_BASE = GP2; width 3 → reads GP2, GP3, GP4.
-    cfg.set_in_pins(&[&clk_in_pin, &clk_pull_pin, &data_in_pin]);
-
-    let clock_freq = U24F8::from_num(embassy_rp::clocks::clk_sys_freq());
-    cfg.clock_divider = clock_freq / U24F8::from_num(PIO_CLK_HZ);
-
-    cfg.fifo_join = FifoJoin::RxOnly;
-    cfg.shift_in = ShiftConfig {
-        auto_fill: true,
-        threshold: 30,
-        direction: ShiftDirection::Right,
-    };
-
-    sm0.set_config(&cfg);
-    sm0.set_enable(true);
-
-    defmt::info!(
-        "ps2 kbd oversampler armed: PIO1 SM0, GP2/3/4, {} MHz / {} = {} kHz sample",
-        embassy_rp::clocks::clk_sys_freq() / 1_000_000,
-        cfg.clock_divider.to_num::<f32>(),
-        PIO_CLK_HZ / 1000,
-    );
-
+pub async fn run(mut me: KbdOversampler) {
     let mut framer = Framer::new();
     let mut classifier = Classifier::new();
     // Monotonic 1 µs-resolution timestamp. One word = 10 samples = 10 µs.
@@ -165,7 +163,7 @@ pub async fn run(
     let mut t_us: u64 = 0;
 
     loop {
-        let word = sm0.rx().wait_pull().await;
+        let word = me.sm0.rx().wait_pull().await;
 
         let words = KBD_COUNTERS.words.fetch_add(1, Ordering::Relaxed) + 1;
         if clk_toggled_in_word(word) {
@@ -220,7 +218,7 @@ pub async fn run(
         // poll cheaply here without racing the next push; rely on the
         // PIO `rxstall` debug bit via the `stalled()` helper periodically
         // — once every 1024 words is enough.
-        if words & 0x3FF == 0 && sm0.rx().stalled() {
+        if words & 0x3FF == 0 && me.sm0.rx().stalled() {
             KBD_COUNTERS.fifo_overrun.fetch_add(1, Ordering::Relaxed);
         }
     }

@@ -88,12 +88,38 @@ async fn main(spawner: Spawner) {
     spawner
         .spawn(status::neopixel::run(p.PIO2, p.PIN_21, p.DMA_CH0).expect("spawn neopixel"));
 
-    // PS/2 KBD wire oversampler — passive, always-on. PIO1 SM0, GP2/3/4.
-    // Phase 1 bringup: counters update; frame extractor lands next.
-    spawner.spawn(
-        ps2::oversampler::run(p.PIO1, p.PIN_2, p.PIN_3, p.PIN_4)
-            .expect("spawn ps2 kbd oversampler"),
+    // PIO1 hosts both PS/2 KBD state machines:
+    //   SM0 = ps2_kbd_oversample  (1 MS/s wire instrumentation)
+    //   SM1 = ps2_kbd_tx          (device→host frame emitter)
+    // GP3 (CLK_PULL) is read by SM0 for instrumentation AND driven by SM1
+    // when emitting a frame — that's intentional per
+    // docs/pio_state_machines_design.md §6.1.
+    let Pio {
+        common: mut pio1_common,
+        sm0: pio1_sm0,
+        sm1: pio1_sm1,
+        ..
+    } = Pio::new(p.PIO1, ps2::Pio1Irqs);
+    let kbd_clk_in = pio1_common.make_pio_pin(p.PIN_2);
+    let kbd_clk_pull = pio1_common.make_pio_pin(p.PIN_3);
+    let kbd_data_in = pio1_common.make_pio_pin(p.PIN_4);
+    let kbd_data_pull = pio1_common.make_pio_pin(p.PIN_5);
+
+    let oversampler = ps2::oversampler::KbdOversampler::new(
+        &mut pio1_common,
+        pio1_sm0,
+        &kbd_clk_in,
+        &kbd_clk_pull,
+        &kbd_data_in,
     );
+    let _kbd_tx = ps2::tx_kbd::KbdTx::new(
+        &mut pio1_common,
+        pio1_sm1,
+        &kbd_clk_pull,
+        &kbd_data_pull,
+    );
+
+    spawner.spawn(ps2::oversampler::run(oversampler).expect("spawn ps2 kbd oversampler"));
 
     // PIO0 hosts both LPT SPP-nibble state machines:
     //   SM0 = lpt_compat_in   (forward: host → Pico, 9-bit capture)
