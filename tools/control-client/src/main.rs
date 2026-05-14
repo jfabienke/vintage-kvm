@@ -3,36 +3,39 @@
 //!
 //! Connects to the Pico's `control` CDC interface, writes one verb +
 //! arguments line, reads reply lines until the terminator (`ok` or
-//! `err` prefix), prints everything to stdout, exits 0 / 1.
+//! `err` prefix), and emits either:
+//!
+//! - **Text mode** (default): each reply line on its own line.
+//! - **JSON mode** (`--json`): one structured JSON object on stdout
+//!   summarizing success, parsed per-verb data, the raw reply lines,
+//!   and the error message if any. Designed for LLM / scripted callers
+//!   that want a stable schema instead of grepping firmware text.
+//!
+//! Exit code: `0` on `ok`, `1` on `err`. Verb grammar lives in the
+//! firmware (`firmware/src/usb/control.rs`).
 //!
 //! ```sh
 //! control-client ping
 //! # → pong 12345
 //!
-//! control-client stats
-//! # → uptime_ms=…
-//! # → kbd words=… clk_active=… …
-//! # → aux words=… …
-//! # → usb event_drops=…
-//! # → ok
+//! control-client --json ping
+//! # → {"ok":true,"verb":"ping","data":{"uptime_ms":12345},"lines":["pong 12345"]}
 //!
-//! control-client mouse_move 10 -5
-//! # → ok
+//! control-client --json stats
+//! # → {"ok":true,"verb":"stats","data":{"uptime_ms":…,"kbd":{…},…},…}
 //!
-//! control-client bulk_test hello
-//! # → ok bulk queued 21B
+//! control-client --json mouse_move 10 -5
+//! # → {"ok":true,"verb":"mouse_move","data":{},"lines":["ok"]}
 //!
-//! control-client --port /dev/cu.usbmodemX  ping
+//! control-client --port /dev/cu.usbmodemX --json bulk_test hello
 //! ```
-//!
-//! Verb grammar lives in the firmware (`firmware/src/usb/control.rs`),
-//! not here — the client is intentionally a dumb pipe so verb additions
-//! don't need a host-side bump.
 
 use std::io::{BufRead, BufReader, Write};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
+use serde_json::{Map, Value};
 
 const VID: u16 = 0xC0DE;
 const PID: u16 = 0xCAFE;
@@ -42,27 +45,79 @@ const PID: u16 = 0xCAFE;
 /// short of a Stage 0 typing run (those don't go through this CLI).
 const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 
-fn main() -> Result<()> {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
+#[derive(Default)]
+struct Args {
+    port_override: Option<String>,
+    json: bool,
+    rest: Vec<String>,
+}
 
-    let mut port_override: Option<String> = None;
-    if args.first().map(|s| s == "--port").unwrap_or(false) {
-        args.remove(0);
-        if args.is_empty() {
-            bail!("--port needs a path argument");
+fn parse_args() -> Result<Args> {
+    let mut out = Args::default();
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--port" => {
+                out.port_override = Some(
+                    it.next()
+                        .context("--port needs a path argument")?,
+                );
+            }
+            "--json" => out.json = true,
+            "-h" | "--help" => {
+                eprintln!("{USAGE}");
+                std::process::exit(0);
+            }
+            _ => {
+                out.rest.push(a);
+                // Everything after the verb is verbatim — don't try to
+                // re-interpret as flags.
+                out.rest.extend(it);
+                break;
+            }
         }
-        port_override = Some(args.remove(0));
     }
-
-    if args.is_empty() {
-        bail!(
-            "usage: control-client [--port <path>] <verb> [args...]\n\
-             verbs: ping, stats, inject <hex>..., mouse_move <dx> <dy>,\n\
-                    mouse_button l|r|m up|down, bulk_test [text]"
-        );
+    if out.rest.is_empty() {
+        bail!("missing verb\n\n{USAGE}");
     }
+    Ok(out)
+}
 
-    let port_path = match port_override {
+const USAGE: &str = "\
+usage: control-client [--port <path>] [--json] <verb> [args...]
+
+verbs: ping
+       stats
+       inject <hex> [hex ...]
+       mouse_move <dx> <dy>
+       mouse_button l|r|m up|down
+       bulk_test [text]
+
+--json   emit a single JSON object summarizing the reply
+--port   override CDC auto-detection (e.g. /dev/cu.usbmodem01)";
+
+#[derive(Serialize)]
+struct JsonReply {
+    ok: bool,
+    verb: String,
+    /// Per-verb parsed payload. Empty object when there's nothing
+    /// structured to extract (mouse_move/mouse_button success).
+    data: Value,
+    /// First trimmed reply line that begins with `err ` (minus the
+    /// prefix). Absent on success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    /// Every reply line we received, in order, trimmed of trailing
+    /// CR/LF. The connection banner is filtered out.
+    lines: Vec<String>,
+}
+
+fn main() -> Result<()> {
+    let args = parse_args()?;
+    let line = args.rest.join(" ");
+    let verb = args.rest[0].clone();
+
+    let port_path = match args.port_override {
         Some(p) => p,
         None => auto_detect_control()
             .context("auto-detect failed; pass --port <path> explicitly")?,
@@ -79,7 +134,6 @@ fn main() -> Result<()> {
     // it before any reply. We could drain it with a short timeout
     // first, but it's simpler and race-free to send our verb and
     // filter the banner line out of the reply stream.
-    let line = args.join(" ");
     let mut writer = port.try_clone().context("clone port for writer")?;
     writer.write_all(line.as_bytes()).context("write verb")?;
     writer.write_all(b"\r").context("write terminator")?;
@@ -87,7 +141,10 @@ fn main() -> Result<()> {
 
     let mut reader = BufReader::new(port);
     let mut buf = String::new();
-    let mut exit_code = 0;
+    let mut lines: Vec<String> = Vec::new();
+    let mut ok = true;
+    let mut error: Option<String> = None;
+
     loop {
         buf.clear();
         let n = reader
@@ -96,26 +153,133 @@ fn main() -> Result<()> {
         if n == 0 {
             bail!("port closed before reply complete");
         }
-        let line = buf.trim_end_matches(['\r', '\n']);
+        let trimmed = buf.trim_end_matches(['\r', '\n']).to_string();
 
-        // Banner is harmless but noisy — filter once.
-        if line.starts_with("vintage-kvm control") {
+        if trimmed.starts_with("vintage-kvm control") {
             continue;
         }
 
-        println!("{line}");
+        lines.push(trimmed.clone());
 
-        if line.starts_with("ok") {
+        if let Some(rest) = trimmed.strip_prefix("err") {
+            ok = false;
+            error = Some(rest.trim_start().to_string());
             break;
         }
-        if line.starts_with("err") {
-            exit_code = 1;
+        if trimmed == "ok" || trimmed.starts_with("ok ") {
             break;
         }
-        // Anything else is a stats body line; keep reading until ok/err.
+        // Otherwise: body line (stats etc.). Keep reading.
     }
 
-    std::process::exit(exit_code);
+    if args.json {
+        let data = if ok {
+            parse_data(&verb, &lines).unwrap_or_else(|| Value::Object(Map::new()))
+        } else {
+            Value::Object(Map::new())
+        };
+        let reply = JsonReply {
+            ok,
+            verb,
+            data,
+            error,
+            lines,
+        };
+        println!("{}", serde_json::to_string(&reply)?);
+    } else {
+        for line in &lines {
+            println!("{line}");
+        }
+    }
+
+    std::process::exit(if ok { 0 } else { 1 });
+}
+
+/// Per-verb reply parsing. Returns `None` when no structured shape is
+/// known for the verb (caller emits an empty object so the JSON schema
+/// stays stable). Returns `Some(Value::Object(_))` on success.
+///
+/// Parsers are intentionally permissive: if the firmware tweaks its
+/// reply wording the JSON degrades to "data is empty + lines preserved"
+/// instead of failing.
+fn parse_data(verb: &str, lines: &[String]) -> Option<Value> {
+    match verb {
+        "ping" => {
+            // "pong <uptime_ms>"
+            let rest = lines.first()?.strip_prefix("pong")?.trim_start();
+            let n: u64 = rest.parse().ok()?;
+            let mut m = Map::new();
+            m.insert("uptime_ms".into(), Value::from(n));
+            Some(Value::Object(m))
+        }
+        "stats" => Some(parse_stats(lines)),
+        "inject" => {
+            // "ok queued N"
+            let rest = lines.last()?.strip_prefix("ok queued")?.trim_start();
+            let n: u64 = rest.parse().ok()?;
+            let mut m = Map::new();
+            m.insert("queued".into(), Value::from(n));
+            Some(Value::Object(m))
+        }
+        "bulk_test" => {
+            // "ok bulk queued NB"
+            let rest = lines.last()?.strip_prefix("ok bulk queued")?.trim();
+            let num = rest.trim_end_matches('B');
+            let n: u64 = num.parse().ok()?;
+            let mut m = Map::new();
+            m.insert("queued_bytes".into(), Value::from(n));
+            Some(Value::Object(m))
+        }
+        // mouse_move / mouse_button / unknown verbs → bare "ok".
+        _ => None,
+    }
+}
+
+/// Parse the multi-line `stats` reply into a nested JSON object.
+///
+/// Body lines come in two shapes:
+/// - Bare `key=val` (top-level scalar, e.g. `uptime_ms=12345`).
+/// - `section key=val key=val ...` (one section per line, e.g.
+///   `kbd words=… frames=…`).
+///
+/// Numeric values become JSON numbers, everything else stays as a
+/// string. Unknown shapes are dropped (they show up in `lines`).
+fn parse_stats(lines: &[String]) -> Value {
+    let mut top = Map::new();
+    for line in lines {
+        if line.starts_with("ok") {
+            continue;
+        }
+        let mut parts = line.split_ascii_whitespace();
+        let first = match parts.next() {
+            Some(t) => t,
+            None => continue,
+        };
+        if let Some((k, v)) = first.split_once('=') {
+            // Bare `key=val` — top-level entry.
+            top.insert(k.to_string(), kv_value(v));
+            continue;
+        }
+        // Otherwise treat `first` as a section name and the rest as kv pairs.
+        let mut section = Map::new();
+        for tok in parts {
+            if let Some((k, v)) = tok.split_once('=') {
+                section.insert(k.to_string(), kv_value(v));
+            }
+        }
+        top.insert(first.to_string(), Value::Object(section));
+    }
+    Value::Object(top)
+}
+
+fn kv_value(s: &str) -> Value {
+    if let Ok(n) = s.parse::<u64>() {
+        Value::from(n)
+    } else if let Ok(n) = s.parse::<i64>() {
+        Value::from(n)
+    } else {
+        Value::from(s.to_string())
+    }
 }
 
 /// Pick the second CDC ACM device matching our VID/PID — interface
