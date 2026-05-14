@@ -22,8 +22,10 @@ fn main() {
     // dos/stage0/ is the canonical artifact) and makes the firmware
     // build self-contained as long as `nasm` is on the PATH.
     assemble_stage0("s0_at.asm", out.join("s0_at.bin"));
+    assemble_stage0("s0_xt.asm", out.join("s0_xt.bin"));
 
     println!("cargo:rerun-if-changed=../dos/stage0/s0_at.asm");
+    println!("cargo:rerun-if-changed=../dos/stage0/s0_xt.asm");
     println!("cargo:rerun-if-changed=../dos/stage0/s0_atps2_core.inc");
     println!("cargo:rerun-if-changed=../dos/stage0/lpt_nibble.inc");
 }

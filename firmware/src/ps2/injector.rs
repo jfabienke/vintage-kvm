@@ -15,11 +15,15 @@
 //! inter-keystroke delay so the host's keyboard ISR has time to consume
 //! and forward each event to the BIOS keyboard buffer (`0040:001E`).
 //!
-//! ## Phase 2 v4 scope (this revision)
+//! ## Phase 2 v5 scope (this revision)
 //!
-//! Types a real DOS DEBUG session that loads the production
-//! `S0_AT.COM` Stage 0 (1635 bytes, NASM-assembled from
-//! `dos/stage0/s0_at.asm`) into memory and runs it:
+//! Types a real DOS DEBUG session that loads the production Stage 0
+//! binary matched to the detected host class:
+//!
+//!   - AT / PS-2 → `S0_AT.COM` (1635 bytes, Set 2 scancodes).
+//!   - XT        → `S0_XT.COM` (1082 bytes, Set 1 scancodes).
+//!
+//! Both binaries are NASM-assembled from `dos/stage0/` by `build.rs`.
 //!
 //! ```text
 //! debug<CR>
@@ -98,6 +102,12 @@ const STAGE0_ORIGIN: u16 = 0x0100;
 /// changes.
 const STAGE0_AT_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/s0_at.bin"));
 
+/// Production XT-class Stage 0 binary. NASM-built from
+/// `dos/stage0/s0_xt.asm`. Smaller than the AT variant (no i8042
+/// mastery — XT keyboards are hardware-unidirectional, so the
+/// keyboard private channel of `s0_at.asm` doesn't apply).
+const STAGE0_XT_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/s0_xt.bin"));
+
 /// Rough wall-clock estimate for typing N bytes of Stage 0 binary via
 /// DEBUG `e` commands at our current pacing. Used only for an
 /// informational defmt log so the operator knows what to expect.
@@ -129,7 +139,6 @@ impl BootstrapInjector {
         Timer::after_millis(KEYSTROKE_GAP_MS).await;
     }
 
-    #[allow(dead_code)] // wired in once Set 1 ASCII table lands
     async fn type_scancode_xt(&mut self, scancode: u8) {
         // Make.
         self.kbd_tx.send_xt_byte(scancode).await;
@@ -140,37 +149,54 @@ impl BootstrapInjector {
     }
 
     /// Type an ASCII string on an AT/PS-2 host by translating each
-    /// character through the Set 2 scancode table. Unmapped bytes (e.g.,
-    /// shifted punctuation that v2 doesn't cover) are skipped with a
-    /// warning.
+    /// character through the Set 2 scancode table. Unmapped bytes are
+    /// skipped with a warning.
     async fn type_ascii_at(&mut self, ascii: &[u8]) {
         for &c in ascii {
             let code = scancode::ascii_to_set2(c);
             if code == 0 {
-                defmt::warn!("injector: ASCII 0x{:02X} has no scancode mapping", c);
+                defmt::warn!("injector: ASCII 0x{:02X} has no Set 2 mapping", c);
                 continue;
             }
             self.type_scancode_at(code).await;
         }
     }
 
-    /// Drive a full DEBUG session: launch DEBUG, enter Stage 0 bytes
-    /// via `e` commands, then `g 100` to hand control over. Each line
-    /// gets a short cool-down so DEBUG can echo and parse. Once Stage
-    /// 0 runs it owns the host — we don't bother typing `q` to quit
-    /// DEBUG; Stage 0 won't return to it on the production path.
-    async fn type_debug_stage0_at(&mut self) {
+    /// Type an ASCII string on an XT host by translating each character
+    /// through the Set 1 scancode table. Unmapped bytes are skipped
+    /// with a warning.
+    async fn type_ascii_xt(&mut self, ascii: &[u8]) {
+        for &c in ascii {
+            let code = scancode::ascii_to_set1(c);
+            if code == 0 {
+                defmt::warn!("injector: ASCII 0x{:02X} has no Set 1 mapping", c);
+                continue;
+            }
+            self.type_scancode_xt(code).await;
+        }
+    }
+
+    /// Drive a full DEBUG session: launch DEBUG, enter the Stage 0
+    /// bytes via `e` commands, then `g 100` to hand control over. Each
+    /// line gets a short cool-down so DEBUG can echo and parse. Once
+    /// Stage 0 runs it owns the host — we don't bother typing `q` to
+    /// quit DEBUG; Stage 0 won't return to it on the production path.
+    ///
+    /// `class` selects the scancode table: AT/PS-2 use Set 2, XT uses
+    /// Set 1. `stage0_bin` is whichever production .COM is matched to
+    /// the host class.
+    async fn type_debug_stage0(&mut self, class: MachineClass, stage0_bin: &[u8]) {
         defmt::info!(
             "injector: typing Stage 0 ({} bytes) via DEBUG — ~{} sec",
-            STAGE0_AT_BIN.len(),
-            estimated_seconds(STAGE0_AT_BIN.len())
+            stage0_bin.len(),
+            estimated_seconds(stage0_bin.len())
         );
 
-        self.type_ascii_at(b"debug\r").await;
+        self.type_ascii(class, b"debug\r").await;
         Timer::after_millis(DEBUG_STARTUP_MS).await;
 
         let mut addr = STAGE0_ORIGIN;
-        for chunk in STAGE0_AT_BIN.chunks(E_CHUNK) {
+        for chunk in stage0_bin.chunks(E_CHUNK) {
             // "e XXXX BB×16\r" → max ~55 chars.
             let mut cmd: String<64> = String::new();
             let _ = write!(cmd, "e {:x}", addr);
@@ -178,31 +204,33 @@ impl BootstrapInjector {
                 let _ = write!(cmd, " {:02x}", b);
             }
             let _ = cmd.push('\r');
-            self.type_ascii_at(cmd.as_bytes()).await;
+            self.type_ascii(class, cmd.as_bytes()).await;
             addr += chunk.len() as u16;
             Timer::after_millis(DEBUG_LINE_GAP_MS).await;
         }
 
-        // Run Stage 0. It takes over LPT + i8042 and starts the CAP_REQ
-        // handshake with the Pico; control does not return to DEBUG.
+        // Run Stage 0. On AT/PS-2 it takes over LPT + i8042 and starts
+        // the CAP_REQ handshake; on XT it owns LPT only (no i8042
+        // mastery possible). Control does not return to DEBUG.
         let mut go: String<16> = String::new();
         let _ = write!(go, "g {:x}\r", STAGE0_ORIGIN);
-        self.type_ascii_at(go.as_bytes()).await;
+        self.type_ascii(class, go.as_bytes()).await;
+    }
+
+    /// Class-dispatched ASCII typer used by the DEBUG driver.
+    async fn type_ascii(&mut self, class: MachineClass, ascii: &[u8]) {
+        match class {
+            MachineClass::At | MachineClass::Ps2 => self.type_ascii_at(ascii).await,
+            MachineClass::Xt => self.type_ascii_xt(ascii).await,
+        }
     }
 
     async fn type_script(&mut self, class: MachineClass) {
-        match class {
-            MachineClass::At | MachineClass::Ps2 => self.type_debug_stage0_at().await,
-            MachineClass::Xt => {
-                // Set 1 scancode table is a follow-up. For now log and
-                // skip so we don't drive nonsense onto the XT wire.
-                defmt::warn!(
-                    "injector: XT class not yet supported by the DEBUG typer; \
-                     {} bytes of Stage 0 skipped",
-                    STAGE0_AT_BIN.len()
-                );
-            }
-        }
+        let bin = match class {
+            MachineClass::At | MachineClass::Ps2 => STAGE0_AT_BIN,
+            MachineClass::Xt => STAGE0_XT_BIN,
+        };
+        self.type_debug_stage0(class, bin).await;
     }
 }
 
