@@ -25,8 +25,9 @@ use embassy_time::Timer;
 use fixed::types::U24F8;
 
 use super::ring_dma::{self, RingHandle, RING_WORDS};
+use super::supervisor::AUX_ACTIVITY;
 use super::Framer;
-use vintage_kvm_ps2_framer::Classifier;
+use vintage_kvm_ps2_framer::FrameKind;
 
 /// 4-bit samples packed into 28-bit autopush threshold = 7 samples / word.
 pub const SAMPLES_PER_WORD: usize = 7;
@@ -146,14 +147,13 @@ impl AuxOversampler {
 
 const POLL_INTERVAL_MS: u64 = 2;
 
-/// AUX drain task — same shape as KBD but reports AUX activity to the
-/// classifier (which promotes Confirmed(At) → Confirmed(Ps2)). For now
-/// the framer output is just logged; integration with a shared
-/// classifier instance lands when we have a supervisor task.
+/// AUX drain task. Signals the supervisor on each well-formed frame so
+/// the shared classifier can promote `Confirmed(At) → Confirmed(Ps2)`.
+/// Frame *content* on the AUX channel is mouse-protocol traffic, which
+/// the classifier doesn't care about — only its existence.
 #[embassy_executor::task]
 pub async fn run(mut me: AuxOversampler) {
     let mut framer = Framer::new();
-    let mut classifier = Classifier::new();
     let mut t_us: u64 = 0;
 
     loop {
@@ -195,12 +195,14 @@ pub async fn run(mut me: AuxOversampler) {
                         frame.framing_ok,
                     );
 
-                    // The AUX classifier instance is only used here as a
-                    // local sanity check (mostly to confirm AUX frames are
-                    // well-formed); the supervisor's promotion logic will
-                    // call `ingest_aux_activity` on a shared classifier
-                    // once the supervisor lands.
-                    let _ = classifier.ingest_kbd_frame(&frame);
+                    // Signal supervisor on any well-formed frame —
+                    // existence is the only thing the classifier needs.
+                    let usable = frame.framing_ok
+                        && frame.parity_ok
+                        && frame.kind != FrameKind::Invalid;
+                    if usable {
+                        AUX_ACTIVITY.signal(());
+                    }
                 }
 
                 t_us += 1;

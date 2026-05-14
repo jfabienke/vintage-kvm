@@ -148,6 +148,7 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(ps2::oversampler::run(kbd_oversampler).expect("spawn ps2 kbd oversampler"));
     spawner.spawn(ps2::aux_oversampler::run(aux_oversampler).expect("spawn ps2 aux oversampler"));
+    spawner.spawn(ps2::supervisor::run().expect("spawn ps2 supervisor"));
 
     // PIO0 hosts both LPT SPP-nibble state machines:
     //   SM0 = lpt_compat_in   (forward: host → Pico, 9-bit capture)

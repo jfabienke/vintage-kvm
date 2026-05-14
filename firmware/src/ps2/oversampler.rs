@@ -24,8 +24,8 @@ use embassy_time::Timer;
 use fixed::types::U24F8;
 
 use super::ring_dma::{self, RingHandle, RING_WORDS};
+use super::supervisor::KBD_FRAMES;
 use super::Framer;
-use vintage_kvm_ps2_framer::{Classifier, ClassifierEvent};
 
 /// Number of 3-bit samples packed into one RX-FIFO word. 10 × 3 = 30 bits,
 /// matching the autopush threshold; the top 2 bits of each word are zero.
@@ -172,7 +172,6 @@ const POLL_INTERVAL_MS: u64 = 2;
 #[embassy_executor::task]
 pub async fn run(mut me: KbdOversampler) {
     let mut framer = Framer::new();
-    let mut classifier = Classifier::new();
     // Monotonic 1 µs-resolution timestamp. One word = 10 samples = 10 µs.
     // u64 wraps after ~580k years; never our problem.
     let mut t_us: u64 = 0;
@@ -225,16 +224,10 @@ pub async fn run(mut me: KbdOversampler) {
                         frame.start_timestamp_us,
                     );
 
-                    if let Some(ev) = classifier.ingest_kbd_frame(&frame) {
-                        match ev {
-                            ClassifierEvent::Detected(class) => {
-                                defmt::info!("ps2 classifier: Detected({})", class);
-                            }
-                            ClassifierEvent::Reset => {
-                                defmt::info!("ps2 classifier: Reset (host re-classifying)");
-                            }
-                        }
-                    }
+                    // Forward to the supervisor's shared classifier.
+                    // Drop on full channel — losing one observation
+                    // doesn't impair convergence.
+                    let _ = KBD_FRAMES.try_send(frame);
                 }
 
                 t_us += 1;

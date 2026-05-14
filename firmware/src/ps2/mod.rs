@@ -22,6 +22,7 @@
 pub mod aux_oversampler;
 pub mod oversampler;
 pub mod ring_dma;
+pub mod supervisor;
 pub mod tx;
 
 // Single PIO1 IRQ binding shared by both PIO1 state machines (oversampler
