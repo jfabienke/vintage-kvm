@@ -122,6 +122,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(usb::run_device(usb_stack.device).expect("spawn usb device"));
     spawner.spawn(usb::events::run(usb_stack.events).expect("spawn usb events writer"));
     spawner.spawn(usb::control::run(usb_stack.control).expect("spawn usb control"));
+    spawner.spawn(usb::console::run(usb_stack.console).expect("spawn usb console"));
     spawner.spawn(usb::bulk::run_writer(usb_stack.bulk_in).expect("spawn usb bulk writer"));
     spawner.spawn(usb::bulk::run_reader(usb_stack.bulk_out).expect("spawn usb bulk reader"));
 

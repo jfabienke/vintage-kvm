@@ -22,3 +22,10 @@ test-all   = "host-test"
 
 [target.thumbv8m.main-none-eabihf]
 runner = "probe-rs run --chip RP235x"
+
+[env]
+# Composite USB descriptor: 3 CDC ACM functions (2 interfaces each) +
+# 1 vendor-bulk function = 7 interfaces, over embassy-usb's default of 4.
+# Mirrored in firmware/.cargo/config.toml for cargo invocations made from
+# inside the firmware/ crate.
+EMBASSY_USB_MAX_INTERFACE_COUNT = "8"

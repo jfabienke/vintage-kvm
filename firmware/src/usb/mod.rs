@@ -1,12 +1,11 @@
-//! USB device stack. Composite device with three landed interfaces
+//! USB device stack. Composite device with four landed interfaces
 //! per `docs/usb_interface_design.md`:
 //!
 //! - `events`  — CDC ACM IN-only telemetry stream (Phase 4a).
 //! - `control` — CDC ACM bidirectional RPC (Phase 4b).
+//! - `console` — CDC ACM bidirectional vintage-host terminal proxy
+//!               (Phase 5a; currently loopback, see [`console`]).
 //! - `bulk`    — vendor-class bulk IN+OUT for blobs (Phase 6).
-//!
-//! The `console` CDC slot is left for Phase 5 and plugs onto the same
-//! `Builder` when it lands.
 
 use embassy_rp::Peri;
 use embassy_rp::bind_interrupts;
@@ -17,6 +16,7 @@ use embassy_usb::{Builder, Config, UsbDevice};
 use static_cell::StaticCell;
 
 pub mod bulk;
+pub mod console;
 pub mod control;
 pub mod events;
 
@@ -34,25 +34,29 @@ const PRODUCT: &str = "Pico1284";
 type UsbDriver = Driver<'static, USB>;
 
 /// All of embassy-usb's persistent buffers in one bag so the static_cells
-/// are colocated and easy to size-tune.
+/// are colocated and easy to size-tune. `config_descriptor` is bumped
+/// to 512 because three CDC ACM IAD bundles + one vendor IAD push past
+/// the 256-byte fit the smaller layouts had.
 pub struct UsbResources {
-    pub config_descriptor: [u8; 256],
+    pub config_descriptor: [u8; 512],
     pub bos_descriptor: [u8; 256],
     pub msos_descriptor: [u8; 256],
     pub control_buf: [u8; 128],
     pub events_state: CdcState<'static>,
     pub control_state: CdcState<'static>,
+    pub console_state: CdcState<'static>,
 }
 
 impl UsbResources {
     pub const fn new() -> Self {
         Self {
-            config_descriptor: [0; 256],
+            config_descriptor: [0; 512],
             bos_descriptor: [0; 256],
             msos_descriptor: [0; 256],
             control_buf: [0; 128],
             events_state: CdcState::new(),
             control_state: CdcState::new(),
+            console_state: CdcState::new(),
         }
     }
 }
@@ -61,11 +65,13 @@ static RESOURCES: StaticCell<UsbResources> = StaticCell::new();
 
 /// Composite USB device plus the class / endpoint handles landed
 /// today: events (IN-only CDC telemetry), control (bidirectional CDC
-/// RPC), and the vendor bulk IN/OUT pair.
+/// RPC), console (bidirectional vintage-host terminal proxy), and the
+/// vendor bulk IN/OUT pair.
 pub struct UsbStack {
     pub device: UsbDevice<'static, UsbDriver>,
     pub events: CdcAcmClass<'static, UsbDriver>,
     pub control: CdcAcmClass<'static, UsbDriver>,
+    pub console: CdcAcmClass<'static, UsbDriver>,
     pub bulk_in: Endpoint<'static, USB, In>,
     pub bulk_out: Endpoint<'static, USB, Out>,
 }
@@ -103,6 +109,7 @@ pub fn build(usb: Peri<'static, USB>) -> UsbStack {
 
     let events_class = CdcAcmClass::new(&mut builder, &mut r.events_state, 64);
     let control_class = CdcAcmClass::new(&mut builder, &mut r.control_state, 64);
+    let console_class = CdcAcmClass::new(&mut builder, &mut r.console_state, 64);
 
     // Vendor-class function for the bulk interface. Class 0xFF
     // (vendor-specific) lets libusb / WinUSB claim it; the host picks
@@ -123,6 +130,7 @@ pub fn build(usb: Peri<'static, USB>) -> UsbStack {
         device,
         events: events_class,
         control: control_class,
+        console: console_class,
         bulk_in,
         bulk_out,
     }
