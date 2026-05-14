@@ -167,6 +167,7 @@ async fn main(spawner: Spawner) {
     let compat_in = PioCompatIn::new(
         &mut common,
         sm0,
+        p.DMA_CH3,
         p.PIN_11,
         p.PIN_12,
         p.PIN_13,

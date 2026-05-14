@@ -8,6 +8,7 @@
 pub mod compat;
 pub mod pio_compat_in;
 pub mod pio_nibble_out;
+pub mod ring_dma;
 
 // Single PIO0 IRQ binding shared by every PIO0 SM (compat-in on SM0,
 // nibble-out on SM1). embassy's bind_interrupts! disallows re-binding the

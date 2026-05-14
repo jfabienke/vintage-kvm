@@ -1,13 +1,9 @@
-//! IEEE 1284 SPP / nibble-mode forward byte capture, PIO-driven.
+//! IEEE 1284 SPP / nibble-mode forward byte capture, PIO + DMA-ring.
 //!
 //! Implements `lpt_compat_in` from `docs/pio_state_machines_design.md`
 //! §10.1: a 3-instruction PIO program that waits for the host-strobe
 //! falling edge, samples (strobe, D0..D7) into the ISR via `in pins, 9`
 //! with autopush, then waits for the strobe to return high.
-//!
-//! Replaces the bit-bang `recv_byte` path that shipped with Phase 3 v0.9.
-//! The reverse (nibble-out) path stays bit-bang for now; PIO
-//! `lpt_nibble_out` lands in a follow-up.
 //!
 //! Pin map:
 //!   * IN_BASE = host-strobe (assumed GP11; flagged TBD in
@@ -17,16 +13,29 @@
 //! Decode on the CPU side: `byte = ((word >> 1) & 0xFF) as u8` — the
 //! low bit is the strobe (always 0 at the sample point because the
 //! `wait 0` just fired), bits 1..8 are D0..D7.
+//!
+//! ## DMA-ring offload
+//!
+//! Bytes pushed by the PIO are drained by DMA_CH3 into a 1 KB ring
+//! (see [`super::ring_dma`]) rather than CPU-pulled per word. The PIO
+//! RX FIFO is never CPU-visible while DMA is running, so `recv_byte`
+//! polls the ring with a 200 µs Timer when empty. This frees the
+//! per-byte `wait_pull` future overhead and gives the byte stream
+//! ~50 ms of slack at SPP-nibble rates (~5 kHz). For the future
+//! Phase 5 EPP/ECP modes (250 kHz), the same ring still has ~1 ms of
+//! slack — well above the poll interval.
 
 use embassy_rp::Peri;
 use embassy_rp::peripherals::{
-    PIN_11, PIN_12, PIN_13, PIN_14, PIN_15, PIN_16, PIN_17, PIN_18, PIN_19, PIO0,
+    DMA_CH3, PIN_11, PIN_12, PIN_13, PIN_14, PIN_15, PIN_16, PIN_17, PIN_18, PIN_19, PIO0,
 };
 use embassy_rp::pio::{
     Common, Config, FifoJoin, LoadedProgram, ShiftConfig, ShiftDirection, StateMachine,
 };
+use embassy_time::Timer;
 use fixed::types::U24F8;
 
+use super::ring_dma::{self, RingHandle};
 use super::{LptError, LptMode, LptPhy};
 
 /// 3-instruction `lpt_compat_in` program. Loops:
@@ -61,19 +70,28 @@ impl<'d> CompatInProgram<'d> {
     }
 }
 
-/// Owns the loaded PIO state machine + the nine consumed pin handles.
+/// Owns the loaded PIO state machine + the nine consumed pin handles
+/// + the DMA-ring drain.
 pub struct PioCompatIn {
+    #[allow(dead_code)] // held to keep the SM alive even though DMA drains it
     sm0: StateMachine<'static, PIO0, 0>,
+    ring: RingHandle,
 }
+
+/// Inter-poll latency floor. At SPP-nibble rates (~5 kHz bytes / 200 µs
+/// per byte) this matches one byte's worth of wire time, so a calling
+/// task awaiting `recv_byte` sleeps at most one byte behind real-time.
+const POLL_INTERVAL_US: u64 = 200;
 
 impl PioCompatIn {
     /// Claim PIO0 SM0 + the nine input pins (host strobe at IN_BASE,
-    /// then D0..D7) and arm the program. Pins are configured as PIO
-    /// inputs; callers must not have already wrapped them in
+    /// then D0..D7) + DMA_CH3 and arm the program. Pins are configured
+    /// as PIO inputs; callers must not have already wrapped them in
     /// `gpio::Input` or driven them as outputs.
     pub fn new(
         common: &mut Common<'static, PIO0>,
         mut sm0: StateMachine<'static, PIO0, 0>,
+        dma_ch: Peri<'static, DMA_CH3>,
         strobe: Peri<'static, PIN_11>,
         d0: Peri<'static, PIN_12>,
         d1: Peri<'static, PIN_13>,
@@ -126,14 +144,24 @@ impl PioCompatIn {
             embassy_rp::clocks::clk_sys_freq() / 1_000_000
         );
 
-        Self { sm0 }
+        // Arm DMA AFTER the SM is enabled so the very first byte the
+        // PIO captures lands in the ring rather than stalling the SM.
+        let ring = ring_dma::arm(dma_ch);
+
+        Self { sm0, ring }
     }
 
     /// Block until the next host-strobe falling edge, then return the
-    /// captured byte.
+    /// captured byte. Polls the DMA ring with a 200 µs Timer fallback
+    /// when no bytes are available; bursts return back-to-back without
+    /// sleeping.
     pub async fn recv_byte(&mut self) -> u8 {
-        let word = self.sm0.rx().wait_pull().await;
-        ((word >> 1) & 0xFF) as u8
+        loop {
+            if let Some(word) = self.ring.try_pop() {
+                return ((word >> 1) & 0xFF) as u8;
+            }
+            Timer::after_micros(POLL_INTERVAL_US).await;
+        }
     }
 }
 
