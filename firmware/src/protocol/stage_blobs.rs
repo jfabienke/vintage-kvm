@@ -58,7 +58,9 @@ pub fn stage2_crc32() -> u32 {
 /// Concrete `BlockSource` for the embedded Stage 2 placeholder.
 ///
 /// CRC is computed once at construction so the trait's `crc32()` call is
-/// free at serve time.
+/// free at serve time. `new()` uses the portable software path;
+/// `with_crc()` accepts a precomputed value so the firmware can hand in
+/// a DMA-sniffer-derived CRC instead.
 pub struct EmbeddedStage2 {
     crc: u32,
 }
@@ -68,6 +70,10 @@ impl EmbeddedStage2 {
         Self {
             crc: stage2_crc32(),
         }
+    }
+
+    pub const fn with_crc(crc: u32) -> Self {
+        Self { crc }
     }
 }
 

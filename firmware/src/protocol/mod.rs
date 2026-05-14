@@ -34,9 +34,13 @@ pub struct SessionState {
 
 impl SessionState {
     pub fn new() -> Self {
+        Self::with_blob(EmbeddedStage2::new())
+    }
+
+    pub fn with_blob(blob: EmbeddedStage2) -> Self {
         Self {
             block_server: BlockServer::new(),
-            blob: EmbeddedStage2::new(),
+            blob,
             tx_seq: 0,
             rx_seq_expected: 0,
             cap_acked: false,

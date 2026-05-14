@@ -31,6 +31,7 @@ use embassy_executor::Spawner;
 use embassy_rp::pio::Pio;
 use {defmt_rtt as _, panic_probe as _};
 
+mod crc_sniffer;
 mod irqs;
 mod lifecycle;
 mod lpt;
@@ -41,10 +42,12 @@ mod telemetry;
 mod transport;
 mod util;
 
+use crc_sniffer::SnifferCrc32;
 use lifecycle::SupervisorState;
 use lpt::compat::SppNibblePhy;
 use lpt::pio_compat_in::PioCompatIn;
 use lpt::pio_nibble_out::PioNibbleOut;
+use protocol::stage_blobs::{EmbeddedStage2, STAGE2_PLACEHOLDER};
 use ps2::tx::{AuxTx, KbdTx};
 use protocol::{handle_packet, DispatchOutcome, SessionState};
 use telemetry::{DefmtEmit, Event, TelemetryEmit};
@@ -74,10 +77,24 @@ async fn main(spawner: Spawner) {
         fw_version: FW_VERSION,
         phase: 3,
     });
+
+    // DMA-sniffer CRC-32 engine. Run the standard test vector at boot
+    // so a misconfigured sniffer fails loudly, then compute the Stage 2
+    // image CRC via the same hardware path.
+    let mut sniffer = SnifferCrc32::new(p.DMA_CH5);
+    let selftest = sniffer.compute(b"123456789");
+    defmt::assert_eq!(
+        selftest,
+        0xCBF43926u32,
+        "DMA sniffer self-test failed; expected 0xCBF43926, got {:#010X}",
+        selftest
+    );
+    let stage2_crc = sniffer.compute(STAGE2_PLACEHOLDER);
+    let stage2_blob = EmbeddedStage2::with_crc(stage2_crc);
     info!(
-        "stage2 placeholder: {} bytes, CRC-32 = 0x{:08X}",
+        "stage2 placeholder: {} bytes, CRC-32 = 0x{:08X} (hw)",
         protocol::stage_blobs::STAGE2_SIZE,
-        protocol::stage_blobs::stage2_crc32()
+        stage2_crc
     );
 
     // GP21 = NeoPixel WS2812 (visible supervisor lifecycle indicator).
@@ -201,7 +218,7 @@ async fn main(spawner: Spawner) {
     lifecycle::set(SupervisorState::ServeCapHandshake);
 
     info!("LPT SPP-nibble transport ready; entering serve loop");
-    serve_loop(transport).await;
+    serve_loop(transport, stage2_blob).await;
 }
 
 /// Run forever: receive a packet, dispatch, send any reply, repeat.
@@ -209,8 +226,8 @@ async fn main(spawner: Spawner) {
 /// Phase 3 makes no attempt at recovery beyond what `PacketReassembler`
 /// already does (resync on bad SOH / CRC / ETX). The telemetry stream is
 /// the diagnostic surface for unhealthy wires.
-async fn serve_loop<T: Transport>(mut transport: T) -> ! {
-    let mut state = SessionState::new();
+async fn serve_loop<T: Transport>(mut transport: T, blob: EmbeddedStage2) -> ! {
+    let mut state = SessionState::with_blob(blob);
     let telemetry = DefmtEmit;
 
     loop {
