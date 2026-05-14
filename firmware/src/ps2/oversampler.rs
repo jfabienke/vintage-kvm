@@ -15,12 +15,15 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use embassy_rp::peripherals::PIO1;
+use embassy_rp::Peri;
+use embassy_rp::peripherals::{DMA_CH1, PIO1};
 use embassy_rp::pio::{
     Common, Config, FifoJoin, LoadedProgram, Pin, ShiftConfig, ShiftDirection, StateMachine,
 };
+use embassy_time::Timer;
 use fixed::types::U24F8;
 
+use super::ring_dma::{self, RingHandle, RING_WORDS};
 use super::Framer;
 use vintage_kvm_ps2_framer::{Classifier, ClassifierEvent};
 
@@ -107,19 +110,23 @@ fn clk_toggled_in_word(word: u32) -> bool {
 }
 
 pub struct KbdOversampler {
+    #[allow(dead_code)] // held to keep the SM alive even though we don't poll it
     sm0: StateMachine<'static, PIO1, 0>,
+    ring: RingHandle,
 }
 
 impl KbdOversampler {
-    /// Configure PIO1 SM0 to run the oversampler program. Pins are passed
-    /// by reference so the caller can reuse GP3 (CLK_PULL) for the TX SM
-    /// without re-claiming the Peri handle.
+    /// Configure PIO1 SM0 to run the oversampler program and arm DMA_CH1
+    /// to stream its RX FIFO into a 4 KB ring buffer. Pins are passed
+    /// by reference so the caller can reuse GP3 (CLK_PULL) for the TX
+    /// SM without re-claiming the Peri handle.
     pub fn new(
         common: &mut Common<'static, PIO1>,
         mut sm0: StateMachine<'static, PIO1, 0>,
         clk_in: &Pin<'static, PIO1>,
         clk_pull: &Pin<'static, PIO1>,
         data_in: &Pin<'static, PIO1>,
+        dma_ch: Peri<'static, DMA_CH1>,
     ) -> Self {
         let program = KbdOversampleProgram::new(common);
 
@@ -148,9 +155,17 @@ impl KbdOversampler {
             PIO_CLK_HZ / 1000,
         );
 
-        Self { sm0 }
+        // Arm DMA AFTER the SM is enabled so the very first sample lands
+        // in the ring.
+        let ring = ring_dma::arm(dma_ch);
+
+        Self { sm0, ring }
     }
 }
+
+/// CPU wake cadence. With the SM running at 100 k words/s and a 1024-
+/// word ring, this leaves a ~5× safety margin between wake events.
+const POLL_INTERVAL_MS: u64 = 2;
 
 /// Spawn target — drains oversampled words forever, feeding the framer +
 /// classifier and updating stats counters.
@@ -163,63 +178,67 @@ pub async fn run(mut me: KbdOversampler) {
     let mut t_us: u64 = 0;
 
     loop {
-        let word = me.sm0.rx().wait_pull().await;
+        Timer::after_millis(POLL_INTERVAL_MS).await;
 
-        let words = KBD_COUNTERS.words.fetch_add(1, Ordering::Relaxed) + 1;
-        if clk_toggled_in_word(word) {
-            KBD_COUNTERS
-                .clk_active_words
-                .fetch_add(1, Ordering::Relaxed);
+        // Cap the batch size at one ring less one slot so we can't
+        // confuse "full" with "empty"; the resync path handles real
+        // overruns separately.
+        let pending = me.ring.pending();
+        if pending >= RING_WORDS - 1 {
+            KBD_COUNTERS.fifo_overrun.fetch_add(1, Ordering::Relaxed);
+            me.ring.resync();
         }
 
-        // Walk 10 samples, oldest-first. With ShiftDirection::Right the
-        // earliest sample sits at the LSB of the word.
-        for i in 0..SAMPLES_PER_WORD {
-            let sample = (word >> (i * 3)) & 0b111;
-            let clk = (sample & 0b001) != 0;
-            // bit 1 = CLK_PULL (our own register, ignored)
-            let data = (sample & 0b100) != 0;
+        me.ring.drain(RING_WORDS - 1, |word| {
+            let words = KBD_COUNTERS.words.fetch_add(1, Ordering::Relaxed) + 1;
+            if clk_toggled_in_word(word) {
+                KBD_COUNTERS
+                    .clk_active_words
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            let _ = words;
 
-            if let Some(frame) = framer.ingest(clk, data, t_us) {
-                KBD_COUNTERS.frames_total.fetch_add(1, Ordering::Relaxed);
-                if !frame.parity_ok || !frame.framing_ok {
-                    KBD_COUNTERS.frames_errored.fetch_add(1, Ordering::Relaxed);
-                }
-                KBD_COUNTERS.glitches_total.fetch_add(
-                    u32::from(frame.timing.glitch_count),
-                    Ordering::Relaxed,
-                );
-                defmt::info!(
-                    "ps2 kbd frame: kind={} data=0x{:02X} parity_ok={} framing_ok={} glitches={} t={}us",
-                    frame.kind,
-                    frame.data,
-                    frame.parity_ok,
-                    frame.framing_ok,
-                    frame.timing.glitch_count,
-                    frame.start_timestamp_us,
-                );
+            // Walk 10 samples, oldest-first. With ShiftDirection::Right
+            // the earliest sample sits at the LSB of the word.
+            for i in 0..SAMPLES_PER_WORD {
+                let sample = (word >> (i * 3)) & 0b111;
+                let clk = (sample & 0b001) != 0;
+                // bit 1 = CLK_PULL (our own register, ignored)
+                let data = (sample & 0b100) != 0;
 
-                if let Some(ev) = classifier.ingest_kbd_frame(&frame) {
-                    match ev {
-                        ClassifierEvent::Detected(class) => {
-                            defmt::info!("ps2 classifier: Detected({})", class);
-                        }
-                        ClassifierEvent::Reset => {
-                            defmt::info!("ps2 classifier: Reset (host re-classifying)");
+                if let Some(frame) = framer.ingest(clk, data, t_us) {
+                    KBD_COUNTERS.frames_total.fetch_add(1, Ordering::Relaxed);
+                    if !frame.parity_ok || !frame.framing_ok {
+                        KBD_COUNTERS.frames_errored.fetch_add(1, Ordering::Relaxed);
+                    }
+                    KBD_COUNTERS.glitches_total.fetch_add(
+                        u32::from(frame.timing.glitch_count),
+                        Ordering::Relaxed,
+                    );
+                    defmt::info!(
+                        "ps2 kbd frame: kind={} data=0x{:02X} parity_ok={} framing_ok={} glitches={} t={}us",
+                        frame.kind,
+                        frame.data,
+                        frame.parity_ok,
+                        frame.framing_ok,
+                        frame.timing.glitch_count,
+                        frame.start_timestamp_us,
+                    );
+
+                    if let Some(ev) = classifier.ingest_kbd_frame(&frame) {
+                        match ev {
+                            ClassifierEvent::Detected(class) => {
+                                defmt::info!("ps2 classifier: Detected({})", class);
+                            }
+                            ClassifierEvent::Reset => {
+                                defmt::info!("ps2 classifier: Reset (host re-classifying)");
+                            }
                         }
                     }
                 }
+
+                t_us += 1;
             }
-
-            t_us += 1;
-        }
-
-        // Heuristic FIFO-overrun check. The SM has no error flag we can
-        // poll cheaply here without racing the next push; rely on the
-        // PIO `rxstall` debug bit via the `stalled()` helper periodically
-        // — once every 1024 words is enough.
-        if words & 0x3FF == 0 && me.sm0.rx().stalled() {
-            KBD_COUNTERS.fifo_overrun.fetch_add(1, Ordering::Relaxed);
-        }
+        });
     }
 }

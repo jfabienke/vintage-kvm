@@ -111,6 +111,7 @@ async fn main(spawner: Spawner) {
         &kbd_clk_in,
         &kbd_clk_pull,
         &kbd_data_in,
+        p.DMA_CH1,
     );
     let _kbd_tx = ps2::tx_kbd::KbdTx::new(
         &mut pio1_common,
