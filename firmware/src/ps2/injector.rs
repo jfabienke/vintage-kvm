@@ -37,6 +37,7 @@
 use embassy_time::Timer;
 use vintage_kvm_signatures::MachineClass;
 
+use super::scancode;
 use super::supervisor::INJECT_TRIGGER;
 use super::tx::KbdTx;
 use crate::lifecycle::{self, SupervisorState};
@@ -45,10 +46,11 @@ use crate::lifecycle::{self, SupervisorState};
 /// per-event latency on every host class we care about.
 const KEYSTROKE_GAP_MS: u64 = 5;
 
-/// Placeholder script for Phase 2 v1: scancodes 'A', 'B', 'C' in Set
-/// 2 / Set 1 (they happen to be the same low byte across the two
-/// scancode sets for these letters: 0x1C, 0x32, 0x21).
-const PLACEHOLDER_SCRIPT: &[u8] = &[0x1C, 0x32, 0x21];
+/// Bootstrap script — typed verbatim at the DOS prompt. Phase 2 v2 is
+/// a visible-echo demo (`echo pico1284\r`); the real DEBUG-command
+/// script that builds Stage 0 in memory layers on top of this typing
+/// infrastructure.
+const BOOTSTRAP_ASCII: &[u8] = b"echo pico1284\r";
 
 pub struct BootstrapInjector {
     kbd_tx: KbdTx,
@@ -70,6 +72,7 @@ impl BootstrapInjector {
         Timer::after_millis(KEYSTROKE_GAP_MS).await;
     }
 
+    #[allow(dead_code)] // wired in once Set 1 ASCII table lands
     async fn type_scancode_xt(&mut self, scancode: u8) {
         // Make.
         self.kbd_tx.send_xt_byte(scancode).await;
@@ -79,11 +82,32 @@ impl BootstrapInjector {
         Timer::after_millis(KEYSTROKE_GAP_MS).await;
     }
 
-    async fn type_script(&mut self, script: &[u8], class: MachineClass) {
-        for &code in script {
-            match class {
-                MachineClass::Xt => self.type_scancode_xt(code).await,
-                MachineClass::At | MachineClass::Ps2 => self.type_scancode_at(code).await,
+    /// Type an ASCII string on an AT/PS-2 host by translating each
+    /// character through the Set 2 scancode table. Unmapped bytes (e.g.,
+    /// shifted punctuation that v2 doesn't cover) are skipped with a
+    /// warning.
+    async fn type_ascii_at(&mut self, ascii: &[u8]) {
+        for &c in ascii {
+            let code = scancode::ascii_to_set2(c);
+            if code == 0 {
+                defmt::warn!("injector: ASCII 0x{:02X} has no scancode mapping", c);
+                continue;
+            }
+            self.type_scancode_at(code).await;
+        }
+    }
+
+    async fn type_script(&mut self, ascii: &[u8], class: MachineClass) {
+        match class {
+            MachineClass::At | MachineClass::Ps2 => self.type_ascii_at(ascii).await,
+            MachineClass::Xt => {
+                // Set 1 scancode table is a follow-up. For now log and
+                // skip so we don't drive nonsense onto the XT wire.
+                defmt::warn!(
+                    "injector: XT class not yet supported by the ASCII typer; \
+                     {} bytes skipped",
+                    ascii.len()
+                );
             }
         }
     }
@@ -98,9 +122,9 @@ pub async fn run(mut me: BootstrapInjector) {
         defmt::info!("injector: starting bootstrap for {}", class);
         lifecycle::set(SupervisorState::InjectDebug);
 
-        me.type_script(PLACEHOLDER_SCRIPT, class).await;
+        me.type_script(BOOTSTRAP_ASCII, class).await;
 
-        defmt::info!("injector: placeholder script complete");
+        defmt::info!("injector: bootstrap script complete");
         lifecycle::set(SupervisorState::ServeStage0Download);
     }
 }
