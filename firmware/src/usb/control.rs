@@ -10,10 +10,17 @@
 //!
 //! - `ping` → `pong <uptime_ms>`
 //! - `stats` → multi-line counter dump
+//! - `inject <hex> [hex ...]` → enqueue raw scancode bytes for the KBD
+//!   wire. AT framing only; XT inject is deferred. Up to
+//!   `INJECT_RAW_MAX` bytes per command.
+//! - `mouse_move <dx> <dy>` → send a PS/2 mouse-movement packet on
+//!   the AUX wire. Deltas clamp to 9-bit signed (-256..=255).
+//! - `mouse_button l|r|m up|down` → press / release a mouse button.
+//!   Button state is sticky across move commands.
 //! - everything else → `err unknown verb: <name>`
 //!
-//! Future verbs (`inject`, `mouse_move`, `dump_ring`, …) plug in by
-//! adding arms to `dispatch`.
+//! Future verbs (`dump_ring`, `set`, …) plug in by adding arms to
+//! `dispatch`.
 
 use core::fmt::Write;
 use core::sync::atomic::Ordering;
@@ -26,6 +33,8 @@ use embassy_usb::driver::EndpointError;
 use heapless::String;
 
 use crate::ps2::aux_oversampler::AUX_COUNTERS;
+use crate::ps2::injector::{INJECT_RAW, INJECT_RAW_MAX};
+use crate::ps2::mouse_input::{MouseBtn, MouseCmd, MOUSE_CMD};
 use crate::ps2::oversampler::{KBD_COUNTERS, KBD_SELF_TX_FRAMES};
 use crate::usb::events::USB_EVENT_DROPS;
 
@@ -87,12 +96,106 @@ async fn dispatch(line: &str, class: &mut CdcAcmClass<'static, Driver<'static, U
         "stats" => {
             let _ = send_stats(class).await;
         }
+        "inject" => handle_inject(parts, class).await,
+        "mouse_move" => handle_mouse_move(parts, class).await,
+        "mouse_button" => handle_mouse_button(parts, class).await,
         other => {
             let mut out: String<64> = String::new();
             let _ = write!(out, "err unknown verb: {other}");
             let _ = send_line(class, &out).await;
         }
     }
+}
+
+async fn handle_inject(
+    parts: core::str::SplitAsciiWhitespace<'_>,
+    class: &mut CdcAcmClass<'static, Driver<'static, USB>>,
+) {
+    let mut bytes: heapless::Vec<u8, INJECT_RAW_MAX> = heapless::Vec::new();
+    for tok in parts {
+        match u8::from_str_radix(tok, 16) {
+            Ok(b) => {
+                if bytes.push(b).is_err() {
+                    let _ = send_line(class, "err inject too long").await;
+                    return;
+                }
+            }
+            Err(_) => {
+                let mut out: String<64> = String::new();
+                let _ = write!(out, "err bad hex byte: {tok}");
+                let _ = send_line(class, &out).await;
+                return;
+            }
+        }
+    }
+    if bytes.is_empty() {
+        let _ = send_line(class, "err inject needs at least one hex byte").await;
+        return;
+    }
+    let n = bytes.len();
+    if INJECT_RAW.try_send(bytes).is_err() {
+        let _ = send_line(class, "err inject queue full").await;
+        return;
+    }
+    let mut out: String<32> = String::new();
+    let _ = write!(out, "ok queued {n}");
+    let _ = send_line(class, &out).await;
+}
+
+async fn handle_mouse_move(
+    mut parts: core::str::SplitAsciiWhitespace<'_>,
+    class: &mut CdcAcmClass<'static, Driver<'static, USB>>,
+) {
+    let dx = match parts.next().and_then(|s| s.parse::<i16>().ok()) {
+        Some(v) => v,
+        None => {
+            let _ = send_line(class, "err mouse_move: bad dx").await;
+            return;
+        }
+    };
+    let dy = match parts.next().and_then(|s| s.parse::<i16>().ok()) {
+        Some(v) => v,
+        None => {
+            let _ = send_line(class, "err mouse_move: bad dy").await;
+            return;
+        }
+    };
+    if MOUSE_CMD.try_send(MouseCmd::Move { dx, dy }).is_err() {
+        let _ = send_line(class, "err mouse queue full").await;
+        return;
+    }
+    let _ = send_line(class, "ok").await;
+}
+
+async fn handle_mouse_button(
+    mut parts: core::str::SplitAsciiWhitespace<'_>,
+    class: &mut CdcAcmClass<'static, Driver<'static, USB>>,
+) {
+    let btn = match parts.next() {
+        Some("l") | Some("L") => MouseBtn::Left,
+        Some("r") | Some("R") => MouseBtn::Right,
+        Some("m") | Some("M") => MouseBtn::Middle,
+        _ => {
+            let _ = send_line(class, "err mouse_button: expected l|r|m").await;
+            return;
+        }
+    };
+    let down = match parts.next() {
+        Some("down") => true,
+        Some("up") => false,
+        _ => {
+            let _ = send_line(class, "err mouse_button: expected up|down").await;
+            return;
+        }
+    };
+    if MOUSE_CMD
+        .try_send(MouseCmd::Button { btn, down })
+        .is_err()
+    {
+        let _ = send_line(class, "err mouse queue full").await;
+        return;
+    }
+    let _ = send_line(class, "ok").await;
 }
 
 async fn send_stats(class: &mut CdcAcmClass<'static, Driver<'static, USB>>) -> Result<(), EndpointError> {

@@ -174,7 +174,7 @@ async fn main(spawner: Spawner) {
         &aux_data_in,
         p.DMA_CH2,
     );
-    let _aux_tx = AuxTx::new(
+    let aux_tx = AuxTx::new(
         &mut pio1_common,
         pio1_sm3,
         &aux_clk_pull,
@@ -183,11 +183,13 @@ async fn main(spawner: Spawner) {
     );
 
     let injector = ps2::injector::BootstrapInjector::new(kbd_tx);
+    let mouse_injector = ps2::mouse_input::MouseInjector::new(aux_tx);
 
     spawner.spawn(ps2::oversampler::run(kbd_oversampler).expect("spawn ps2 kbd oversampler"));
     spawner.spawn(ps2::aux_oversampler::run(aux_oversampler).expect("spawn ps2 aux oversampler"));
     spawner.spawn(ps2::supervisor::run().expect("spawn ps2 supervisor"));
     spawner.spawn(ps2::injector::run(injector).expect("spawn ps2 injector"));
+    spawner.spawn(ps2::mouse_input::run(mouse_injector).expect("spawn ps2 mouse injector"));
 
     // PIO0 hosts both LPT SPP-nibble state machines:
     //   SM0 = lpt_compat_in   (forward: host → Pico, 9-bit capture)

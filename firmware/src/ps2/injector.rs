@@ -65,14 +65,29 @@
 
 use core::fmt::Write;
 
+use embassy_futures::select::{select, Either};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_time::Timer;
-use heapless::String;
+use heapless::{String, Vec};
 use vintage_kvm_signatures::MachineClass;
 
 use super::scancode;
 use super::supervisor::INJECT_TRIGGER;
 use super::tx::KbdTx;
 use crate::lifecycle::{self, SupervisorState};
+
+/// Maximum bytes per raw-inject request. The control verb is meant for
+/// short ad-hoc sequences (a make/break pair, a scancode test); larger
+/// scripts go through the Stage 0 bootstrap path instead.
+pub const INJECT_RAW_MAX: usize = 32;
+
+/// Ad-hoc raw-byte inject queue from the USB control RPC. Each request
+/// is a small Vec of scancode bytes that get streamed verbatim through
+/// `KbdTx::send_at_byte`. Depth 4 absorbs operator typing bursts while
+/// the injector is busy with the bootstrap script (~90 sec).
+pub static INJECT_RAW: Channel<CriticalSectionRawMutex, Vec<u8, INJECT_RAW_MAX>, 4> =
+    Channel::new();
 
 /// Inter-keystroke pacing. 5 ms is well above the keyboard ISR's
 /// per-event latency on every host class we care about.
@@ -237,15 +252,26 @@ impl BootstrapInjector {
 #[embassy_executor::task]
 pub async fn run(mut me: BootstrapInjector) {
     loop {
-        let class = INJECT_TRIGGER.wait().await;
-        INJECT_TRIGGER.reset();
-
-        defmt::info!("injector: starting bootstrap for {}", class);
-        lifecycle::set(SupervisorState::InjectDebug);
-
-        me.type_script(class).await;
-
-        defmt::info!("injector: bootstrap script complete");
-        lifecycle::set(SupervisorState::ServeStage0Download);
+        // Multiplex between the classifier-driven Stage 0 bootstrap
+        // (one-shot signal) and ad-hoc raw-byte injects from the USB
+        // control RPC (channel). A bootstrap in progress monopolizes
+        // the loop; ad-hoc injects queue and fire afterwards.
+        match select(INJECT_TRIGGER.wait(), INJECT_RAW.receive()).await {
+            Either::First(class) => {
+                INJECT_TRIGGER.reset();
+                defmt::info!("injector: starting bootstrap for {}", class);
+                lifecycle::set(SupervisorState::InjectDebug);
+                me.type_script(class).await;
+                defmt::info!("injector: bootstrap script complete");
+                lifecycle::set(SupervisorState::ServeStage0Download);
+            }
+            Either::Second(bytes) => {
+                defmt::info!("injector: raw inject ({} bytes)", bytes.len());
+                for &b in bytes.iter() {
+                    me.kbd_tx.send_at_byte(b).await;
+                    Timer::after_millis(KEYSTROKE_GAP_MS).await;
+                }
+            }
+        }
     }
 }

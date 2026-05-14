@@ -21,6 +21,7 @@
 
 pub mod aux_oversampler;
 pub mod injector;
+pub mod mouse_input;
 pub mod oversampler;
 pub mod ring_dma;
 pub mod scancode;
