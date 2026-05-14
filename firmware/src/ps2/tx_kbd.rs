@@ -50,6 +50,7 @@ use embassy_rp::pio::{
     StateMachine,
 };
 use fixed::types::U24F8;
+use vintage_kvm_ps2_framer::{pack_at_frame, pack_xt_frame};
 
 /// PIO clock target: 100 kHz → 10 µs/cycle. Bit time = 8 cycles = 80 µs.
 const PIO_CLK_HZ: u32 = 100_000;
@@ -182,35 +183,5 @@ impl KbdTx {
     }
 }
 
-/// Pack a byte into an 11-bit AT/PS-2 frame, LSB-first, padded with 1s in
-/// the unused high bits so the OSR shifts out "idle high" if the PIO
-/// program over-consumes.
-///
-/// Bit layout (LSB → MSB):
-///   * bit 0     = start (0)
-///   * bits 1..8 = data D0..D7 (LSB-first)
-///   * bit 9     = odd parity
-///   * bit 10    = stop (1)
-///   * bits 11.. = 1s (idle-high padding)
-pub fn pack_at_frame(byte: u8) -> u32 {
-    let mut w: u32 = 0xFFFF_F800; // padding bits 11..31 = 1
-    // start bit (bit 0) = 0 — already cleared
-    w |= (byte as u32) << 1;
-    let parity: u32 = if byte.count_ones() & 1 == 0 { 1 } else { 0 };
-    w |= parity << 9;
-    w |= 1 << 10; // stop
-    w
-}
-
-/// Pack a byte into a 9-bit XT frame (start=1, then 8 data bits LSB-first).
-/// No parity, no stop.
-pub fn pack_xt_frame(byte: u8) -> u32 {
-    let mut w: u32 = 0xFFFF_FE00; // padding bits 9..31 = 1
-    w |= 1; // start bit
-    w |= (byte as u32) << 1;
-    w
-}
-
-// Host-side coverage for pack_at_frame / pack_xt_frame should live in a
-// workspace crate (same TODO as the framer extraction) — firmware is
-// no_std / no_main.
+// Frame packing lives in `crates/ps2-framer::packer` — see that crate's
+// tests/packer.rs for the layout + round-trip coverage.

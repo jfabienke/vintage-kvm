@@ -19,6 +19,8 @@
 
 mod framer;
 pub mod classifier;
+pub mod packer;
 
 pub use framer::{Framer, FrameKind, FrameTiming, Ps2Frame, GLITCH_THRESHOLD_US, IDLE_TIMEOUT_US};
 pub use classifier::{Classifier, Event as ClassifierEvent, State as ClassifierState};
+pub use packer::{pack_at_frame, pack_xt_frame};
