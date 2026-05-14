@@ -1,0 +1,170 @@
+//! CDC ACM `control` interface — bidirectional RPC channel.
+//!
+//! Per `docs/usb_interface_design.md` §4.2 the v1 protocol is one
+//! request per line, `\r` or `\n` terminated, plain-text verbs. The
+//! design doc names JSON-lines as the eventual format; we stay text
+//! for now so an operator with `screen /dev/ttyACM1` can drive the
+//! Pico interactively without any client tooling.
+//!
+//! ## Verbs landed in this revision
+//!
+//! - `ping` → `pong <uptime_ms>`
+//! - `stats` → multi-line counter dump
+//! - everything else → `err unknown verb: <name>`
+//!
+//! Future verbs (`inject`, `mouse_move`, `dump_ring`, …) plug in by
+//! adding arms to `dispatch`.
+
+use core::fmt::Write;
+use core::sync::atomic::Ordering;
+
+use embassy_rp::peripherals::USB;
+use embassy_rp::usb::Driver;
+use embassy_time::Instant;
+use embassy_usb::class::cdc_acm::CdcAcmClass;
+use embassy_usb::driver::EndpointError;
+use heapless::String;
+
+use crate::ps2::aux_oversampler::AUX_COUNTERS;
+use crate::ps2::oversampler::{KBD_COUNTERS, KBD_SELF_TX_FRAMES};
+use crate::usb::events::USB_EVENT_DROPS;
+
+/// Inbound buffer: we accept ASCII commands up to one line.
+const LINE_CAP: usize = 128;
+/// Outbound: a stats dump is several short lines; the writer chunks
+/// to 64-byte CDC packets so this only bounds one logical message.
+const OUT_CAP: usize = 512;
+
+#[embassy_executor::task]
+pub async fn run(mut class: CdcAcmClass<'static, Driver<'static, USB>>) -> ! {
+    let mut line: String<LINE_CAP> = String::new();
+    let mut buf = [0u8; 64];
+
+    loop {
+        class.wait_connection().await;
+        defmt::info!("usb control: host connected");
+
+        line.clear();
+        let _ = send_line(&mut class, "vintage-kvm control v1 — type 'ping' or 'stats'").await;
+
+        loop {
+            let n = match class.read_packet(&mut buf).await {
+                Ok(n) => n,
+                Err(_) => {
+                    defmt::warn!("usb control: read failed; reconnect");
+                    break;
+                }
+            };
+
+            for &b in &buf[..n] {
+                if b == b'\r' || b == b'\n' {
+                    if !line.is_empty() {
+                        dispatch(&line, &mut class).await;
+                        line.clear();
+                    }
+                } else if line.push(b as char).is_err() {
+                    // Overflow → drop the line and report.
+                    let _ = send_line(&mut class, "err line too long").await;
+                    line.clear();
+                }
+            }
+        }
+    }
+}
+
+async fn dispatch(line: &str, class: &mut CdcAcmClass<'static, Driver<'static, USB>>) {
+    let trimmed = line.trim();
+    let mut parts = trimmed.split_ascii_whitespace();
+    let verb = parts.next().unwrap_or("");
+
+    match verb {
+        "" => {}
+        "ping" => {
+            let mut out: String<32> = String::new();
+            let _ = write!(out, "pong {}", Instant::now().as_millis());
+            let _ = send_line(class, &out).await;
+        }
+        "stats" => {
+            let _ = send_stats(class).await;
+        }
+        other => {
+            let mut out: String<64> = String::new();
+            let _ = write!(out, "err unknown verb: {other}");
+            let _ = send_line(class, &out).await;
+        }
+    }
+}
+
+async fn send_stats(class: &mut CdcAcmClass<'static, Driver<'static, USB>>) -> Result<(), EndpointError> {
+    let mut out: String<OUT_CAP> = String::new();
+    let _ = writeln_into(
+        &mut out,
+        format_args!("uptime_ms={}", Instant::now().as_millis()),
+    );
+
+    let _ = writeln_into(
+        &mut out,
+        format_args!(
+            "kbd words={} clk_active={} frames={} errored={} self_tx={} fifo_ovr={} glitches={}",
+            KBD_COUNTERS.words.load(Ordering::Relaxed),
+            KBD_COUNTERS.clk_active_words.load(Ordering::Relaxed),
+            KBD_COUNTERS.frames_total.load(Ordering::Relaxed),
+            KBD_COUNTERS.frames_errored.load(Ordering::Relaxed),
+            KBD_SELF_TX_FRAMES.load(Ordering::Relaxed),
+            KBD_COUNTERS.fifo_overrun.load(Ordering::Relaxed),
+            KBD_COUNTERS.glitches_total.load(Ordering::Relaxed),
+        ),
+    );
+    let _ = writeln_into(
+        &mut out,
+        format_args!(
+            "aux words={} clk_active={} frames={} errored={} fifo_ovr={} glitches={}",
+            AUX_COUNTERS.words.load(Ordering::Relaxed),
+            AUX_COUNTERS.clk_active_words.load(Ordering::Relaxed),
+            AUX_COUNTERS.frames_total.load(Ordering::Relaxed),
+            AUX_COUNTERS.frames_errored.load(Ordering::Relaxed),
+            AUX_COUNTERS.fifo_overrun.load(Ordering::Relaxed),
+            AUX_COUNTERS.glitches_total.load(Ordering::Relaxed),
+        ),
+    );
+    let _ = writeln_into(
+        &mut out,
+        format_args!("usb event_drops={}", USB_EVENT_DROPS.load(Ordering::Relaxed)),
+    );
+    let _ = out.push_str("ok\n");
+
+    write_chunks(class, out.as_bytes()).await
+}
+
+fn writeln_into(s: &mut impl core::fmt::Write, args: core::fmt::Arguments<'_>) -> core::fmt::Result {
+    s.write_fmt(args)?;
+    s.write_char('\n')
+}
+
+async fn send_line(
+    class: &mut CdcAcmClass<'static, Driver<'static, USB>>,
+    line: &str,
+) -> Result<(), EndpointError> {
+    let mut buf: String<{ LINE_CAP + 2 }> = String::new();
+    // If the caller's line is too long, truncate rather than fail —
+    // the operator's REPL shouldn't crash on a long diagnostic.
+    let take = line.len().min(LINE_CAP);
+    let _ = buf.push_str(&line[..take]);
+    let _ = buf.push('\n');
+    write_chunks(class, buf.as_bytes()).await
+}
+
+async fn write_chunks(
+    class: &mut CdcAcmClass<'static, Driver<'static, USB>>,
+    bytes: &[u8],
+) -> Result<(), EndpointError> {
+    for chunk in bytes.chunks(64) {
+        class.write_packet(chunk).await?;
+    }
+    if !bytes.is_empty() && bytes.len().is_multiple_of(64) {
+        // Zero-length packet flush so the host's CDC stack doesn't sit
+        // on a packet-aligned buffer waiting for the next byte.
+        class.write_packet(&[]).await?;
+    }
+    Ok(())
+}

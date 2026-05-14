@@ -114,12 +114,14 @@ async fn main(spawner: Spawner) {
     spawner
         .spawn(status::neopixel::run(p.PIO2, p.PIN_21, p.DMA_CH0).expect("spawn neopixel"));
 
-    // USB composite device — Phase 4a: one CDC ACM `events` interface.
-    // The `control`, `console`, and vendor-bulk interfaces will land on
-    // top of the same Builder in later phases.
-    let (usb_device, events_class) = usb::build(p.USB);
-    spawner.spawn(usb::run_device(usb_device).expect("spawn usb device"));
-    spawner.spawn(usb::events::run(events_class).expect("spawn usb events writer"));
+    // USB composite device — Phase 4a/4b: CDC ACM `events` (IN-only
+    // telemetry) + CDC ACM `control` (bidirectional RPC). The
+    // `console` and vendor-bulk interfaces will land on top of the
+    // same Builder in later phases.
+    let usb_stack = usb::build(p.USB);
+    spawner.spawn(usb::run_device(usb_stack.device).expect("spawn usb device"));
+    spawner.spawn(usb::events::run(usb_stack.events).expect("spawn usb events writer"));
+    spawner.spawn(usb::control::run(usb_stack.control).expect("spawn usb control"));
 
     // PIO1 hosts all four PS/2 state machines:
     //   SM0 = ps2_kbd_oversample  (KBD wire instrumentation, GP2/3/4)

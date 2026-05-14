@@ -11,6 +11,7 @@ use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcState};
 use embassy_usb::{Builder, Config, UsbDevice};
 use static_cell::StaticCell;
 
+pub mod control;
 pub mod events;
 
 bind_interrupts!(pub(crate) struct UsbIrqs {
@@ -34,6 +35,7 @@ pub struct UsbResources {
     pub msos_descriptor: [u8; 256],
     pub control_buf: [u8; 128],
     pub events_state: CdcState<'static>,
+    pub control_state: CdcState<'static>,
 }
 
 impl UsbResources {
@@ -44,16 +46,25 @@ impl UsbResources {
             msos_descriptor: [0; 256],
             control_buf: [0; 128],
             events_state: CdcState::new(),
+            control_state: CdcState::new(),
         }
     }
 }
 
 static RESOURCES: StaticCell<UsbResources> = StaticCell::new();
 
-/// Build the composite USB device + the events-CDC class instance.
-/// Spawns the USB control task; returns the CDC class so the caller can
-/// hand it to the events-writer task.
-pub fn build(usb: Peri<'static, USB>) -> (UsbDevice<'static, UsbDriver>, CdcAcmClass<'static, UsbDriver>) {
+/// Composite USB device plus the two CDC class instances landed in
+/// Phase 4: events (IN-only telemetry) and control (bidirectional RPC).
+pub struct UsbStack {
+    pub device: UsbDevice<'static, UsbDriver>,
+    pub events: CdcAcmClass<'static, UsbDriver>,
+    pub control: CdcAcmClass<'static, UsbDriver>,
+}
+
+/// Build the composite USB device + both CDC class instances. The
+/// caller drives `device` via `run_device` and hands each class to its
+/// matching task.
+pub fn build(usb: Peri<'static, USB>) -> UsbStack {
     let driver = Driver::new(usb, UsbIrqs);
 
     let mut config = Config::new(VID, PID);
@@ -82,9 +93,14 @@ pub fn build(usb: Peri<'static, USB>) -> (UsbDevice<'static, UsbDriver>, CdcAcmC
     );
 
     let events_class = CdcAcmClass::new(&mut builder, &mut r.events_state, 64);
+    let control_class = CdcAcmClass::new(&mut builder, &mut r.control_state, 64);
 
-    let usb_device = builder.build();
-    (usb_device, events_class)
+    let device = builder.build();
+    UsbStack {
+        device,
+        events: events_class,
+        control: control_class,
+    }
 }
 
 #[embassy_executor::task]
