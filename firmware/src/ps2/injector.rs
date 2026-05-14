@@ -15,30 +15,38 @@
 //! inter-keystroke delay so the host's keyboard ISR has time to consume
 //! and forward each event to the BIOS keyboard buffer (`0040:001E`).
 //!
-//! ## Phase 2 v3 scope (this revision)
+//! ## Phase 2 v4 scope (this revision)
 //!
-//! Types a real DOS DEBUG session that loads a Stage 0 placeholder
-//! .COM-style program into memory and runs it:
+//! Types a real DOS DEBUG session that loads the production
+//! `S0_AT.COM` Stage 0 (1635 bytes, NASM-assembled from
+//! `dos/stage0/s0_at.asm`) into memory and runs it:
 //!
 //! ```text
 //! debug<CR>
-//! e 100 b4 09 ba 0d 01 cd 21 b8<CR>     ; mov ah,9 / mov dx,010d / int 21 / mov ax (lo)
-//! e 108 00 4c cd 21 cc 50 69 63<CR>     ; (4C ax) int 21 / int3 / "Pic"
-//! e 110 6f 31 32 38 34 20 53 74<CR>     ; "o1284 St"
+//! e 100 ...16 bytes...<CR>               ; many such lines
 //! ...
 //! g 100<CR>                              ; run from 0100h
 //! q<CR>                                  ; quit DEBUG
 //! ```
 //!
-//! Stage 0 prints "Pico1284 Stage 0 ok\r\n" via INT 21h AH=09 and
-//! exits cleanly. On a connected AT/PS-2 host this is end-to-end
-//! visible: type debug commands → DEBUG assembles + runs → banner
-//! appears on screen.
+//! Once Stage 0 takes over it owns LPT + the i8042 keyboard private
+//! channel, sends a CAP_REQ to the Pico, and bootstraps Stage 1 over
+//! the LPT data plane.
 //!
-//! The real production Stage 0 (per `dos/stage0/s0_at.asm`) is far
-//! larger and pivots to the LPT bootstrap channel; replacing this
-//! placeholder is a separate task once the AT/PS-2 wire round-trip is
-//! confirmed.
+//! ## Build dependency
+//!
+//! `build.rs` NASM-assembles `dos/stage0/s0_at.asm` into the cargo
+//! `OUT_DIR` at firmware compile time; `include_bytes!` pulls the
+//! result. NASM must be on `PATH`. Source changes to the .asm or its
+//! includes (`s0_atps2_core.inc`, `lpt_nibble.inc`) automatically
+//! invalidate the firmware build via `cargo:rerun-if-changed`.
+//!
+//! ## Bootstrap duration
+//!
+//! At 1635 bytes / 16 bytes per `e` line / 5 ms per scancode pair
+//! event / 50 ms per-line cool-down, the full type-out takes ~90
+//! seconds. This is a one-time setup cost; once Stage 0 hands off to
+//! Stage 1 over LPT, the system runs at full wire rate.
 //!
 //! ## Self-classification caveat
 //!
@@ -75,38 +83,31 @@ const DEBUG_LINE_GAP_MS: u64 = 50;
 /// the `q` quit.
 const DEBUG_STARTUP_MS: u64 = 500;
 
-/// DEBUG entry-command chunk size: bytes per `e <addr> ...` line. 8
-/// keeps each command well under DEBUG's ~80-char input limit.
-const E_CHUNK: usize = 8;
+/// DEBUG entry-command chunk size: bytes per `e <addr> ...` line. 16
+/// gives a max line length of `"e ffff bb×16\r"` ≈ 55 chars, well
+/// under DEBUG's ~80-char input limit.
+const E_CHUNK: usize = 16;
 
 /// Where DEBUG should load Stage 0. Standard .COM origin.
 const STAGE0_ORIGIN: u16 = 0x0100;
 
-/// Phase 2 v3 Stage 0 placeholder. Prints
-/// "Pico1284 Stage 0 ok\r\n" via INT 21h AH=09 and exits via
-/// INT 21h AH=4Ch AL=00. Layout (offsets from CS:0100h):
-///
-/// ```text
-/// 0100  B4 09           MOV  AH, 09h
-/// 0102  BA 0D 01        MOV  DX, 010Dh
-/// 0105  CD 21           INT  21h
-/// 0107  B8 00 4C        MOV  AX, 4C00h
-/// 010A  CD 21           INT  21h
-/// 010C  CC              INT3            ; never reached
-/// 010D  "Pico1284 Stage 0 ok\r\n$"
-/// ```
-const STAGE0_PLACEHOLDER: &[u8] = &[
-    0xB4, 0x09,             // mov ah, 09h
-    0xBA, 0x0D, 0x01,       // mov dx, 010Dh
-    0xCD, 0x21,             // int 21h
-    0xB8, 0x00, 0x4C,       // mov ax, 4C00h
-    0xCD, 0x21,             // int 21h
-    0xCC,                   // int3
-    // banner at 010Dh:
-    b'P', b'i', b'c', b'o', b'1', b'2', b'8', b'4',
-    b' ', b'S', b't', b'a', b'g', b'e', b' ', b'0',
-    b' ', b'o', b'k', b'\r', b'\n', b'$',
-];
+/// Production AT-class Stage 0 binary, NASM-assembled from
+/// `dos/stage0/s0_at.asm` by the firmware's `build.rs`. The .asm is
+/// the canonical artifact (committed to git); the .COM/.bin output
+/// lives in `OUT_DIR` and is rebuilt automatically when the source
+/// changes.
+const STAGE0_AT_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/s0_at.bin"));
+
+/// Rough wall-clock estimate for typing N bytes of Stage 0 binary via
+/// DEBUG `e` commands at our current pacing. Used only for an
+/// informational defmt log so the operator knows what to expect.
+const fn estimated_seconds(bin_len: usize) -> u32 {
+    // Per chunk: "e XXXX" (~6 chars) + 16 × " bb" (48 chars) + "\r"
+    // = ~55 chars = 55 × 3 scancode events = 165 events × 5 ms = 825 ms,
+    // plus 50 ms line gap = 875 ms per chunk. Round to a flat 900 ms.
+    let chunks = (bin_len + E_CHUNK - 1) / E_CHUNK;
+    (chunks as u32 * 900 + DEBUG_STARTUP_MS as u32) / 1000
+}
 
 pub struct BootstrapInjector {
     kbd_tx: KbdTx,
@@ -153,17 +154,25 @@ impl BootstrapInjector {
         }
     }
 
-    /// Drive a full DEBUG session: launch DEBUG, enter the Stage 0
-    /// bytes via `e` commands, run via `g`, then quit. Each line is
-    /// followed by a short cool-down so DEBUG can echo and parse.
+    /// Drive a full DEBUG session: launch DEBUG, enter Stage 0 bytes
+    /// via `e` commands, then `g 100` to hand control over. Each line
+    /// gets a short cool-down so DEBUG can echo and parse. Once Stage
+    /// 0 runs it owns the host — we don't bother typing `q` to quit
+    /// DEBUG; Stage 0 won't return to it on the production path.
     async fn type_debug_stage0_at(&mut self) {
+        defmt::info!(
+            "injector: typing Stage 0 ({} bytes) via DEBUG — ~{} sec",
+            STAGE0_AT_BIN.len(),
+            estimated_seconds(STAGE0_AT_BIN.len())
+        );
+
         self.type_ascii_at(b"debug\r").await;
         Timer::after_millis(DEBUG_STARTUP_MS).await;
 
         let mut addr = STAGE0_ORIGIN;
-        for chunk in STAGE0_PLACEHOLDER.chunks(E_CHUNK) {
-            // "e XXXX BB BB BB BB BB BB BB BB\r" → max ~32 chars.
-            let mut cmd: String<40> = String::new();
+        for chunk in STAGE0_AT_BIN.chunks(E_CHUNK) {
+            // "e XXXX BB×16\r" → max ~55 chars.
+            let mut cmd: String<64> = String::new();
             let _ = write!(cmd, "e {:x}", addr);
             for &b in chunk {
                 let _ = write!(cmd, " {:02x}", b);
@@ -174,14 +183,11 @@ impl BootstrapInjector {
             Timer::after_millis(DEBUG_LINE_GAP_MS).await;
         }
 
-        // Run Stage 0.
+        // Run Stage 0. It takes over LPT + i8042 and starts the CAP_REQ
+        // handshake with the Pico; control does not return to DEBUG.
         let mut go: String<16> = String::new();
         let _ = write!(go, "g {:x}\r", STAGE0_ORIGIN);
         self.type_ascii_at(go.as_bytes()).await;
-        Timer::after_millis(DEBUG_STARTUP_MS).await;
-
-        // Quit DEBUG; control returns to COMMAND.COM.
-        self.type_ascii_at(b"q\r").await;
     }
 
     async fn type_script(&mut self, class: MachineClass) {
@@ -193,7 +199,7 @@ impl BootstrapInjector {
                 defmt::warn!(
                     "injector: XT class not yet supported by the DEBUG typer; \
                      {} bytes of Stage 0 skipped",
-                    STAGE0_PLACEHOLDER.len()
+                    STAGE0_AT_BIN.len()
                 );
             }
         }
