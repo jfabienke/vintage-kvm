@@ -20,6 +20,7 @@
 #![allow(dead_code)] // Phase 1 scaffold; concrete impls are placeholders.
 
 pub mod aux_oversampler;
+pub mod injector;
 pub mod oversampler;
 pub mod ring_dma;
 pub mod supervisor;

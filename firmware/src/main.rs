@@ -140,7 +140,7 @@ async fn main(spawner: Spawner) {
         &kbd_data_in,
         p.DMA_CH1,
     );
-    let _kbd_tx = KbdTx::new(
+    let kbd_tx = KbdTx::new(
         &mut pio1_common,
         pio1_sm1,
         &kbd_clk_pull,
@@ -164,9 +164,12 @@ async fn main(spawner: Spawner) {
         "aux",
     );
 
+    let injector = ps2::injector::BootstrapInjector::new(kbd_tx);
+
     spawner.spawn(ps2::oversampler::run(kbd_oversampler).expect("spawn ps2 kbd oversampler"));
     spawner.spawn(ps2::aux_oversampler::run(aux_oversampler).expect("spawn ps2 aux oversampler"));
     spawner.spawn(ps2::supervisor::run().expect("spawn ps2 supervisor"));
+    spawner.spawn(ps2::injector::run(injector).expect("spawn ps2 injector"));
 
     // PIO0 hosts both LPT SPP-nibble state machines:
     //   SM0 = lpt_compat_in   (forward: host → Pico, 9-bit capture)

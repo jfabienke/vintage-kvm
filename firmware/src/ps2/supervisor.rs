@@ -27,6 +27,9 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use vintage_kvm_ps2_framer::{Classifier, ClassifierEvent, Ps2Frame};
+use vintage_kvm_signatures::MachineClass;
+
+use crate::lifecycle::{self, SupervisorState};
 
 /// Inbox for KBD frames from the KBD oversampler drain loop. Depth 8
 /// gives ~5 ms of slack at the worst-case ~1.5 kHz frame rate before
@@ -39,8 +42,17 @@ pub static KBD_FRAMES: Channel<CriticalSectionRawMutex, Ps2Frame, 8> = Channel::
 /// only really cares about the first one after Confirmed(At).
 pub static AUX_ACTIVITY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
+/// Fires once per Confirmed classification. The bootstrap injector
+/// task waits on this and starts typing the DEBUG script for the
+/// detected class.
+pub static INJECT_TRIGGER: Signal<CriticalSectionRawMutex, MachineClass> = Signal::new();
+
 #[embassy_executor::task]
 pub async fn run() {
+    // Don't seed `SupervisorState::DetectMachineClass` here — Phase 3
+    // currently boots straight into the LPT serve loop (lifecycle set
+    // by main), and overwriting it would flicker the indicator. The
+    // injector takes over the lifecycle on `Detected`.
     let mut classifier = Classifier::new();
     defmt::info!("ps2 supervisor: running");
 
@@ -65,9 +77,26 @@ fn handle_event(ev: ClassifierEvent) {
     match ev {
         ClassifierEvent::Detected(class) => {
             defmt::info!("ps2 classifier: Detected({})", class);
+            // Hand off to the injector task. Idempotent: if the
+            // injector hasn't consumed the previous signal yet, the
+            // new value overwrites it.
+            INJECT_TRIGGER.signal(class);
         }
         ClassifierEvent::Reset => {
             defmt::info!("ps2 classifier: Reset (host re-classifying)");
+            // Only roll the indicator back if we previously promoted
+            // past detect (i.e., the injector or its successor states).
+            // For Phase 3 where lifecycle stays at LPT states, this is
+            // a no-op.
+            let cur = lifecycle::get();
+            if matches!(
+                cur,
+                SupervisorState::InjectDebug
+                    | SupervisorState::ServeStage0Download
+                    | SupervisorState::ServeStage1Handoff
+            ) {
+                lifecycle::set(SupervisorState::DetectMachineClass);
+            }
         }
     }
 }
