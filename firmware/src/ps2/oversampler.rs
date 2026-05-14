@@ -23,6 +23,8 @@ use embassy_rp::pio::{
 };
 use fixed::types::U24F8;
 
+use super::framer::Framer;
+
 bind_interrupts!(struct Irqs {
     PIO1_IRQ_0 => InterruptHandler<PIO1>;
 });
@@ -40,13 +42,18 @@ pub struct OversamplerCounters {
     /// Total RX-FIFO words drained since boot. One word = 10 samples = 10 µs.
     pub words: AtomicU32,
     /// Words observed where the CLK bit toggled at least once — a rough
-    /// "wire activity" indicator we can show on the dashboard before the
-    /// proper frame extractor lands.
+    /// "wire activity" indicator distinct from the per-frame counters.
     pub clk_active_words: AtomicU32,
     /// PIO RX-FIFO overrun events — incremented when the SM stalls trying
     /// to push because the CPU drain task fell behind. Should stay at 0 in
     /// steady state.
     pub fifo_overrun: AtomicU32,
+    /// Total frames emitted by the framer (any parity/framing result).
+    pub frames_total: AtomicU32,
+    /// Frames that failed odd-parity or start/stop framing checks.
+    pub frames_errored: AtomicU32,
+    /// Sum of `FrameTiming::glitch_count` across all emitted frames.
+    pub glitches_total: AtomicU32,
 }
 
 impl OversamplerCounters {
@@ -55,6 +62,9 @@ impl OversamplerCounters {
             words: AtomicU32::new(0),
             clk_active_words: AtomicU32::new(0),
             fifo_overrun: AtomicU32::new(0),
+            frames_total: AtomicU32::new(0),
+            frames_errored: AtomicU32::new(0),
+            glitches_total: AtomicU32::new(0),
         }
     }
 }
@@ -147,6 +157,11 @@ pub async fn run(
         PIO_CLK_HZ / 1000,
     );
 
+    let mut framer = Framer::new();
+    // Monotonic 1 µs-resolution timestamp. One word = 10 samples = 10 µs.
+    // u64 wraps after ~580k years; never our problem.
+    let mut t_us: u64 = 0;
+
     loop {
         let word = sm0.rx().wait_pull().await;
 
@@ -155,6 +170,36 @@ pub async fn run(
             KBD_COUNTERS
                 .clk_active_words
                 .fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Walk 10 samples, oldest-first. With ShiftDirection::Right the
+        // earliest sample sits at the LSB of the word.
+        for i in 0..SAMPLES_PER_WORD {
+            let sample = (word >> (i * 3)) & 0b111;
+            let clk = (sample & 0b001) != 0;
+            // bit 1 = CLK_PULL (our own register, ignored)
+            let data = (sample & 0b100) != 0;
+
+            if let Some(frame) = framer.ingest(clk, data, t_us) {
+                KBD_COUNTERS.frames_total.fetch_add(1, Ordering::Relaxed);
+                if !frame.parity_ok || !frame.framing_ok {
+                    KBD_COUNTERS.frames_errored.fetch_add(1, Ordering::Relaxed);
+                }
+                KBD_COUNTERS.glitches_total.fetch_add(
+                    u32::from(frame.timing.glitch_count),
+                    Ordering::Relaxed,
+                );
+                defmt::info!(
+                    "ps2 kbd frame: data=0x{:02X} parity_ok={} framing_ok={} glitches={} t={}us",
+                    frame.data,
+                    frame.parity_ok,
+                    frame.framing_ok,
+                    frame.timing.glitch_count,
+                    frame.start_timestamp_us,
+                );
+            }
+
+            t_us += 1;
         }
 
         // Heuristic FIFO-overrun check. The SM has no error flag we can

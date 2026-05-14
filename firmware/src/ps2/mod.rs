@@ -18,6 +18,7 @@
 
 #![allow(dead_code)] // Phase 1 scaffold; concrete impls are placeholders.
 
+pub mod framer;
 pub mod oversampler;
 
 pub use vintage_kvm_signatures::MachineClass;
