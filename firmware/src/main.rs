@@ -28,7 +28,7 @@
 
 use defmt::info;
 use embassy_executor::Spawner;
-use embassy_rp::gpio::{Input, Level, Output, Pull};
+use embassy_rp::gpio::{Level, Output};
 use {defmt_rtt as _, panic_probe as _};
 
 mod lifecycle;
@@ -42,6 +42,7 @@ mod util;
 
 use lifecycle::SupervisorState;
 use lpt::compat::SppNibblePhy;
+use lpt::pio_compat_in::PioCompatIn;
 use protocol::{handle_packet, DispatchOutcome, SessionState};
 use telemetry::{DefmtEmit, Event, TelemetryEmit};
 use transport::{LptTransport, Transport};
@@ -92,23 +93,17 @@ async fn main(spawner: Spawner) {
             .expect("spawn ps2 kbd oversampler"),
     );
 
-    // LPT pin allocation per `docs/hardware_reference.md` §3.3 and
-    // `docs/pico_phase3_design.md`. nInit (host strobe) routing TBD;
-    // GP11 used as the placeholder for now (flagged in lpt::compat).
-    let host_strobe = Input::new(p.PIN_11, Pull::Up);
+    // LPT forward path (DOS → Pico) via PIO0 SM0. Pin allocation per
+    // `docs/hardware_reference.md` §3.3 and `docs/pio_state_machines_design.md`
+    // §10.1: IN_BASE=GP11 (host strobe, currently nInit — flagged TBD in
+    // pio_state_machines_design.md §4.4), GP12..GP19 = D0..D7.
+    let compat_in = PioCompatIn::new(
+        p.PIO0, p.PIN_11, p.PIN_12, p.PIN_13, p.PIN_14, p.PIN_15, p.PIN_16, p.PIN_17, p.PIN_18,
+        p.PIN_19,
+    );
 
-    let data: [Input<'static>; 8] = [
-        Input::new(p.PIN_12, Pull::None),
-        Input::new(p.PIN_13, Pull::None),
-        Input::new(p.PIN_14, Pull::None),
-        Input::new(p.PIN_15, Pull::None),
-        Input::new(p.PIN_16, Pull::None),
-        Input::new(p.PIN_17, Pull::None),
-        Input::new(p.PIN_18, Pull::None),
-        Input::new(p.PIN_19, Pull::None),
-    ];
-
-    // Status outputs (peripheral-driven) — nibble + phase.
+    // Status outputs (peripheral-driven) — nibble + phase. Still bit-bang
+    // pending `lpt_nibble_out` PIO.
     //   bit 0 (LSB) → status[3] = nFault  = GP27
     //   bit 1       → status[4] = Select  = GP26
     //   bit 2       → status[5] = PError  = GP25
@@ -121,8 +116,7 @@ async fn main(spawner: Spawner) {
     let phase = Output::new(p.PIN_24, Level::Low);
 
     let phy = SppNibblePhy::new(
-        data,
-        host_strobe,
+        compat_in,
         nibble_bit0,
         nibble_bit1,
         nibble_bit2,

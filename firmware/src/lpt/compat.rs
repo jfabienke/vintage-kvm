@@ -1,9 +1,10 @@
-//! SPP-compat forward + nibble-reverse bit-bang LPT phy.
+//! SPP-compat forward (PIO) + nibble-reverse bit-bang LPT phy.
 //!
 //! Mirrors the wire protocol of `dos/stage0/lpt_nibble.inc` byte-for-byte
-//! from the peripheral side. Bit-bang is sufficient for SPP-nibble rates
-//! (~25 kB/s effective with our 100 µs settle delays); PIO + DMA waits for
-//! Phase 5 EPP/ECP.
+//! from the peripheral side. The forward (host → Pico) path is driven by
+//! the PIO `lpt_compat_in` program in [`super::pio_compat_in`]; the
+//! reverse (Pico → host) nibble path stays bit-bang for now — PIO
+//! `lpt_nibble_out` lands in a follow-up.
 //!
 //! ## Wire protocol
 //!
@@ -54,9 +55,10 @@
 //! the constant below.
 
 use defmt::trace;
-use embassy_rp::gpio::{Input, Level, Output};
+use embassy_rp::gpio::{Level, Output};
 use embassy_time::Timer;
 
+use super::pio_compat_in::PioCompatIn;
 use super::{LptError, LptMode, LptPhy};
 
 /// Nibble-output pin (status[3] = nFault, LSB of nibble).
@@ -70,21 +72,14 @@ pub type NibbleBit3 = Output<'static>;
 /// Phase-toggle pin (status[7] = Busy).
 pub type PhasePin = Output<'static>;
 
-/// Host-strobe input (nominally nInit; see module-level TODO).
-pub type HostStrobe = Input<'static>;
-
-/// Data-bus inputs: D0..D7 read on every host-strobe falling edge.
-pub type DataPin = Input<'static>;
-
 /// Time the Pico holds a nibble + phase stable so DOS's polling /
 /// debounce loop has a clean window to sample. 100 µs is a generous
 /// envelope vs. DOS's ~80 µs polling cadence (`TIMEOUT_INNER = 0x10`).
 const NIBBLE_SETTLE_US: u64 = 100;
 
 pub struct SppNibblePhy {
-    /// Eight data-line inputs D0-D7. Index 0 = D0.
-    data: [DataPin; 8],
-    host_strobe: HostStrobe,
+    /// PIO-driven forward path (host strobe + D0..D7). Owns PIO0 SM0.
+    compat_in: PioCompatIn,
 
     nibble_bits: (NibbleBit0, NibbleBit1, NibbleBit2, NibbleBit3),
     phase: PhasePin,
@@ -95,8 +90,7 @@ pub struct SppNibblePhy {
 
 impl SppNibblePhy {
     pub fn new(
-        data: [DataPin; 8],
-        host_strobe: HostStrobe,
+        compat_in: PioCompatIn,
         nibble_bit0: NibbleBit0,
         nibble_bit1: NibbleBit1,
         nibble_bit2: NibbleBit2,
@@ -104,8 +98,7 @@ impl SppNibblePhy {
         phase: PhasePin,
     ) -> Self {
         let mut me = Self {
-            data,
-            host_strobe,
+            compat_in,
             nibble_bits: (nibble_bit0, nibble_bit1, nibble_bit2, nibble_bit3),
             phase,
             last_phase: false,
@@ -118,18 +111,10 @@ impl SppNibblePhy {
         me
     }
 
-    /// Wait for the next host-strobe falling edge, then sample D0-D7 into
-    /// a byte (D0 = LSB).
+    /// Wait for the next host-strobe falling edge, then return the byte
+    /// captured by the PIO state machine.
     pub async fn recv_byte(&mut self) -> Result<u8, LptError> {
-        self.host_strobe.wait_for_falling_edge().await;
-        let mut byte: u8 = 0;
-        // The DOS-driven data byte is stable from before the strobe falls
-        // through the strobe pulse, so sequential reads here are safe.
-        for (i, pin) in self.data.iter().enumerate() {
-            if pin.is_high() {
-                byte |= 1 << i;
-            }
-        }
+        let byte = self.compat_in.recv_byte().await;
         trace!("LPT recv 0x{:02X}", byte);
         Ok(byte)
     }

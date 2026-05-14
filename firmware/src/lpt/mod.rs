@@ -6,6 +6,7 @@
 //! treats them uniformly. See `docs/firmware_crate_and_trait_design.md` §3.1.
 
 pub mod compat;
+pub mod pio_compat_in;
 
 #[allow(dead_code)] // `Timeout` is constructed once timeouts land in Phase 4.
 #[derive(Debug, Clone, Copy, defmt::Format)]
