@@ -89,6 +89,14 @@ impl SppNibblePhy {
         trace!("LPT send 0x{:02X}", byte);
         Ok(())
     }
+
+    /// Batched send: hand the whole slice to the PIO via one DMA push.
+    /// CPU prep is microseconds; PIO consumes at wire pace.
+    pub async fn send_bytes(&mut self, bytes: &[u8]) -> Result<(), LptError> {
+        self.nibble_out.send_bytes(bytes).await;
+        trace!("LPT send {}B", bytes.len());
+        Ok(())
+    }
 }
 
 impl LptPhy for SppNibblePhy {
@@ -98,6 +106,10 @@ impl LptPhy for SppNibblePhy {
 
     async fn send_byte(&mut self, b: u8) -> Result<(), LptError> {
         SppNibblePhy::send_byte(self, b).await
+    }
+
+    async fn send_bytes(&mut self, bytes: &[u8]) -> Result<(), LptError> {
+        SppNibblePhy::send_bytes(self, bytes).await
     }
 
     fn current_mode(&self) -> LptMode {

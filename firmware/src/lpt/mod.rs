@@ -62,6 +62,16 @@ pub trait LptPhy {
     /// Send one outbound byte. Cancellable.
     async fn send_byte(&mut self, b: u8) -> Result<(), LptError>;
 
+    /// Send a contiguous byte slice. Default loops over `send_byte`;
+    /// PIO-DMA phys override to batch the whole slice into one DMA
+    /// transfer so the CPU isn't paced byte-by-byte by wire timing.
+    async fn send_bytes(&mut self, bytes: &[u8]) -> Result<(), LptError> {
+        for &b in bytes {
+            self.send_byte(b).await?;
+        }
+        Ok(())
+    }
+
     /// Currently active IEEE 1284 mode.
     fn current_mode(&self) -> LptMode;
 }

@@ -42,10 +42,8 @@ impl<P: LptPhy, T: TelemetryEmit> Transport for LptTransport<P, T> {
             }
         };
 
-        for &b in &buf[..n] {
-            if self.phy.send_byte(b).await.is_err() {
-                return Err(TransportError::PhyHardware);
-            }
+        if self.phy.send_bytes(&buf[..n]).await.is_err() {
+            return Err(TransportError::PhyHardware);
         }
         Ok(())
     }

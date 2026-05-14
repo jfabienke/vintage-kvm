@@ -31,6 +31,7 @@ use embassy_executor::Spawner;
 use embassy_rp::pio::Pio;
 use {defmt_rtt as _, panic_probe as _};
 
+mod irqs;
 mod lifecycle;
 mod lpt;
 mod protocol;
@@ -182,6 +183,7 @@ async fn main(spawner: Spawner) {
     let nibble_out = PioNibbleOut::new(
         &mut common,
         sm1,
+        p.DMA_CH4,
         p.PIN_23, // nAck    (nibble bit 3)
         p.PIN_24, // Busy    (phase)
         p.PIN_25, // PError  (nibble bit 2)

@@ -35,30 +35,42 @@
 //!
 //! Phase toggles on every nibble emission. Over a full byte (two
 //! nibbles), phase toggles twice → returns to its original value. So
-//! the byte-boundary phase is invariant: every `send_byte` starts and
-//! ends with the same phase state, which is whatever we initialized to
-//! at boot (LOW). No CPU-side state tracking needed.
+//! the byte-boundary phase is invariant: every send starts and ends
+//! with the same phase state, which is whatever we initialized to at
+//! boot (LOW). No CPU-side state tracking needed.
+//!
+//! ## DMA-driven batched send
+//!
+//! `send_bytes` packs each byte into one u32 and hands the whole slice
+//! to DMA_CH4 via `sm.tx().dma_push`. The CPU does pack + arm in
+//! microseconds; PIO consumes from the TX FIFO at its own 210 µs/byte
+//! cadence. The Transfer future completes as soon as the last word is
+//! written to the FIFO — the wire output continues for up to ~1.7 ms
+//! after (8-deep FIFO × 210 µs), but that's fine: the caller's next
+//! `recv_byte` blocks waiting for the host's response, which can't
+//! arrive until our last byte reaches it.
 
 use embassy_rp::Peri;
+use embassy_rp::dma;
 use embassy_rp::gpio::Level;
-use embassy_rp::peripherals::{PIN_23, PIN_24, PIN_25, PIN_26, PIN_27, PIO0};
+use embassy_rp::peripherals::{DMA_CH4, PIN_23, PIN_24, PIN_25, PIN_26, PIN_27, PIO0};
 use embassy_rp::pio::{
     Common, Config, Direction, FifoJoin, LoadedProgram, ShiftConfig, ShiftDirection, StateMachine,
 };
-use embassy_time::Timer;
 use fixed::types::U24F8;
 
+use crate::irqs::DmaIrqs;
 use super::{LptError, LptMode, LptPhy};
-
-/// Total wire-time for one byte: 2 × (100 µs settle + ~1 cycle out).
-/// We sleep this long after pushing so a back-to-back `send_byte` never
-/// races the PIO. Could be reduced by polling `sm.tx().stalled()` but
-/// SPP-nibble rates make the extra ~10 µs irrelevant.
-const BYTE_WIRE_TIME_US: u64 = 210;
 
 /// PIO clock target: 100 kHz → 10 µs/cycle, lets `nop [9]` cover the
 /// 100 µs nibble settle in a single instruction.
 const PIO_CLK_HZ: u32 = 100_000;
+
+/// Maximum bytes packable into one DMA batch — sized to fit `MAX_PACKET`
+/// from the protocol crate. One byte = one u32 (two 5-bit nibbles +
+/// padding), so the buffer is 256 × 4 = 1024 bytes on the caller's
+/// stack frame.
+const MAX_BATCH_BYTES: usize = 256;
 
 pub struct NibbleOutProgram<'d> {
     prg: LoadedProgram<'d, PIO0>,
@@ -89,12 +101,14 @@ impl<'d> NibbleOutProgram<'d> {
 
 pub struct PioNibbleOut {
     sm1: StateMachine<'static, PIO0, 1>,
+    dma: dma::Channel<'static>,
 }
 
 impl PioNibbleOut {
     pub fn new(
         common: &mut Common<'static, PIO0>,
         mut sm1: StateMachine<'static, PIO0, 1>,
+        dma_ch: Peri<'static, DMA_CH4>,
         nack: Peri<'static, PIN_23>,
         busy: Peri<'static, PIN_24>,
         perror: Peri<'static, PIN_25>,
@@ -143,7 +157,8 @@ impl PioNibbleOut {
             PIO_CLK_HZ / 1000
         );
 
-        Self { sm1 }
+        let dma = dma::Channel::new(dma_ch, DmaIrqs);
+        Self { sm1, dma }
     }
 
     /// Pack one nibble + phase bit into the 5-bit pin field driven by
@@ -156,22 +171,43 @@ impl PioNibbleOut {
             | (((nibble) & 1) << 4)     // pin 4 (GP27 / nFault)  = nib bit 0
     }
 
-    /// Send one byte as two nibbles (low first), each with phase toggled
-    /// against the previous wire state.
-    pub async fn send_byte(&mut self, byte: u8) {
+    fn pack_byte(byte: u8) -> u32 {
         // Phase invariant: byte boundaries always end at LOW phase (see
         // module docs), so the first nibble of every byte toggles to
         // HIGH and the second toggles back to LOW.
-        let lo_bits = Self::pack_nibble(byte & 0x0F, true) as u32;
-        let hi_bits = Self::pack_nibble((byte >> 4) & 0x0F, false) as u32;
-        let word = lo_bits | (hi_bits << 5);
+        let lo = Self::pack_nibble(byte & 0x0F, true) as u32;
+        let hi = Self::pack_nibble((byte >> 4) & 0x0F, false) as u32;
+        lo | (hi << 5)
+    }
 
-        self.sm1.tx().wait_push(word).await;
-        // Hold off the next push until the PIO has finished driving both
-        // nibbles. Without this the TX FIFO would queue ahead of the
-        // wire and DOS would see two phase toggles before its polling
-        // loop has even registered the first.
-        Timer::after_micros(BYTE_WIRE_TIME_US).await;
+    /// Send one byte. Single-word DMA transfer — mostly used for tests
+    /// or one-shot replies; bulk packet sends go through `send_bytes`.
+    pub async fn send_byte(&mut self, byte: u8) {
+        let words = [Self::pack_byte(byte)];
+        self.sm1.tx().dma_push(&mut self.dma, &words, false).await;
+    }
+
+    /// Send a slice of bytes as one DMA batch. Caller's slice may not
+    /// exceed `MAX_BATCH_BYTES` (= `protocol::MAX_PACKET`). Returns
+    /// after the last byte has been queued into the PIO TX FIFO;
+    /// physical wire output trails by up to ~1.7 ms (FIFO depth × byte
+    /// wire time). For LPT this is benign because the host can't
+    /// respond until the wire output completes.
+    pub async fn send_bytes(&mut self, bytes: &[u8]) {
+        assert!(
+            bytes.len() <= MAX_BATCH_BYTES,
+            "send_bytes batch too large: {} > {}",
+            bytes.len(),
+            MAX_BATCH_BYTES
+        );
+        let mut words = [0u32; MAX_BATCH_BYTES];
+        for (i, &b) in bytes.iter().enumerate() {
+            words[i] = Self::pack_byte(b);
+        }
+        self.sm1
+            .tx()
+            .dma_push(&mut self.dma, &words[..bytes.len()], false)
+            .await;
     }
 }
 
@@ -182,6 +218,11 @@ impl LptPhy for PioNibbleOut {
 
     async fn send_byte(&mut self, b: u8) -> Result<(), LptError> {
         PioNibbleOut::send_byte(self, b).await;
+        Ok(())
+    }
+
+    async fn send_bytes(&mut self, bytes: &[u8]) -> Result<(), LptError> {
+        PioNibbleOut::send_bytes(self, bytes).await;
         Ok(())
     }
 

@@ -12,19 +12,18 @@
 
 use embassy_rp::Peri;
 use embassy_rp::bind_interrupts;
-use embassy_rp::dma;
 use embassy_rp::peripherals::{DMA_CH0, PIN_21, PIO2};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program};
 use embassy_time::{Duration, Timer};
 use smart_leds::RGB8;
 
+use crate::irqs::DmaIrqs;
 use crate::lifecycle;
 use crate::status::animations::{self, Animation};
 
-bind_interrupts!(struct Irqs {
+bind_interrupts!(struct Pio2Irqs {
     PIO2_IRQ_0 => PioInterruptHandler<PIO2>;
-    DMA_IRQ_0  => dma::InterruptHandler<DMA_CH0>;
 });
 
 const OFF: RGB8 = RGB8 { r: 0, g: 0, b: 0 };
@@ -41,10 +40,10 @@ pub async fn run(
     pin: Peri<'static, PIN_21>,
     dma: Peri<'static, DMA_CH0>,
 ) {
-    let Pio { mut common, sm0, .. } = Pio::new(pio, Irqs);
+    let Pio { mut common, sm0, .. } = Pio::new(pio, Pio2Irqs);
     let program = PioWs2812Program::new(&mut common);
     let mut ws: PioWs2812<'_, PIO2, 0, 1, _> =
-        PioWs2812::new(&mut common, sm0, dma, Irqs, pin, &program);
+        PioWs2812::new(&mut common, sm0, dma, DmaIrqs, pin, &program);
 
     let mut state = lifecycle::get();
     let mut anim = animations::for_state(state);
