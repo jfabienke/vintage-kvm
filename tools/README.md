@@ -5,6 +5,7 @@ Dev fixtures and protocol tooling for vintage-kvm. Not part of the production bu
 Tools landed:
 
 - **`events-consumer/`** — host-side reader for the firmware's `events` CDC ACM stream. Auto-detects the Pico by VID/PID, decodes postcard + COBS frames into `Event` values, prints one line per event with a wall-clock timestamp. Run with `cargo run -p vintage-kvm-events-consumer` (auto-detect) or pass `/dev/cu.usbmodemNNN` explicitly.
+- **`control-client/`** — host-side one-shot CLI for the firmware's `control` CDC ACM RPC channel. Sends one verb invocation per run; verb grammar lives in the firmware so additions don't need a client bump. Example: `cargo run -p vintage-kvm-control-client -- ping`. Auto-detects the second CDC (events is the first, control is the second).
 
 Planned tools:
 
