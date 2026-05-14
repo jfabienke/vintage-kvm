@@ -167,6 +167,16 @@ impl KbdOversampler {
 /// word ring, this leaves a ~5× safety margin between wake events.
 const POLL_INTERVAL_MS: u64 = 2;
 
+/// Guard window after the last self-driven CLK_PULL=0 sample. Any
+/// frame emitted within this many µs is considered a loopback of our
+/// own TX (the open-drain buffer mirrors GP3 → wire CLK, which the
+/// oversampler reads via GP2). One AT/PS-2 frame is ~880 µs; 1500 µs
+/// covers the full frame plus a small slack.
+const SELF_TX_GUARD_US: u64 = 1_500;
+
+/// Counter incremented when a frame is dropped as self-driven.
+pub static KBD_SELF_TX_FRAMES: AtomicU32 = AtomicU32::new(0);
+
 /// Spawn target — drains oversampled words forever, feeding the framer +
 /// classifier and updating stats counters.
 #[embassy_executor::task]
@@ -175,6 +185,11 @@ pub async fn run(mut me: KbdOversampler) {
     // Monotonic 1 µs-resolution timestamp. One word = 10 samples = 10 µs.
     // u64 wraps after ~580k years; never our problem.
     let mut t_us: u64 = 0;
+    // Timestamp of the most recent sample where CLK_PULL (GP3) read 0,
+    // i.e., the injector was driving the wire LOW. `None` until first
+    // observation. Frames within `SELF_TX_GUARD_US` of this timestamp
+    // are dropped before reaching the classifier.
+    let mut last_self_tx_us: Option<u64> = None;
 
     loop {
         Timer::after_millis(POLL_INTERVAL_MS).await;
@@ -202,8 +217,15 @@ pub async fn run(mut me: KbdOversampler) {
             for i in 0..SAMPLES_PER_WORD {
                 let sample = (word >> (i * 3)) & 0b111;
                 let clk = (sample & 0b001) != 0;
-                // bit 1 = CLK_PULL (our own register, ignored)
+                let clk_pull = (sample & 0b010) != 0;
                 let data = (sample & 0b100) != 0;
+
+                // Bit 1 = CLK_PULL (GP3, our own output register). If
+                // it reads LOW we are driving the wire — flag for the
+                // self-TX loopback filter below.
+                if !clk_pull {
+                    last_self_tx_us = Some(t_us);
+                }
 
                 if let Some(frame) = framer.ingest(clk, data, t_us) {
                     KBD_COUNTERS.frames_total.fetch_add(1, Ordering::Relaxed);
@@ -214,20 +236,30 @@ pub async fn run(mut me: KbdOversampler) {
                         u32::from(frame.timing.glitch_count),
                         Ordering::Relaxed,
                     );
+
+                    let self_driven = last_self_tx_us
+                        .map(|t| t_us.saturating_sub(t) < SELF_TX_GUARD_US)
+                        .unwrap_or(false);
+
                     defmt::info!(
-                        "ps2 kbd frame: kind={} data=0x{:02X} parity_ok={} framing_ok={} glitches={} t={}us",
+                        "ps2 kbd frame: kind={} data=0x{:02X} parity_ok={} framing_ok={} glitches={} self={} t={}us",
                         frame.kind,
                         frame.data,
                         frame.parity_ok,
                         frame.framing_ok,
                         frame.timing.glitch_count,
+                        self_driven,
                         frame.start_timestamp_us,
                     );
 
-                    // Forward to the supervisor's shared classifier.
-                    // Drop on full channel — losing one observation
-                    // doesn't impair convergence.
-                    let _ = KBD_FRAMES.try_send(frame);
+                    if self_driven {
+                        KBD_SELF_TX_FRAMES.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        // Forward to the supervisor's shared classifier.
+                        // Drop on full channel — losing one observation
+                        // doesn't impair convergence.
+                        let _ = KBD_FRAMES.try_send(frame);
+                    }
                 }
 
                 t_us += 1;
