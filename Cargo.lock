@@ -1511,6 +1511,7 @@ name = "vintage-kvm-ps2-framer"
 version = "0.1.0"
 dependencies = [
  "defmt",
+ "vintage-kvm-signatures",
 ]
 
 [[package]]

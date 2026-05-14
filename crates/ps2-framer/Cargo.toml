@@ -8,7 +8,8 @@ description = "PS/2 wire frame extractor (XT 9-bit + AT/PS2 11-bit) — no_std, 
 [features]
 default = []
 # Enable `defmt::Format` derives on public types (for embedded logging).
-defmt = ["dep:defmt"]
+defmt = ["dep:defmt", "vintage-kvm-signatures/defmt"]
 
 [dependencies]
 defmt = { workspace = true, optional = true }
+vintage-kvm-signatures = { path = "../signatures" }

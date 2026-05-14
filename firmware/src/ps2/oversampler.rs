@@ -24,6 +24,7 @@ use embassy_rp::pio::{
 use fixed::types::U24F8;
 
 use super::Framer;
+use vintage_kvm_ps2_framer::{Classifier, ClassifierEvent};
 
 bind_interrupts!(struct Irqs {
     PIO1_IRQ_0 => InterruptHandler<PIO1>;
@@ -158,6 +159,7 @@ pub async fn run(
     );
 
     let mut framer = Framer::new();
+    let mut classifier = Classifier::new();
     // Monotonic 1 µs-resolution timestamp. One word = 10 samples = 10 µs.
     // u64 wraps after ~580k years; never our problem.
     let mut t_us: u64 = 0;
@@ -190,13 +192,25 @@ pub async fn run(
                     Ordering::Relaxed,
                 );
                 defmt::info!(
-                    "ps2 kbd frame: data=0x{:02X} parity_ok={} framing_ok={} glitches={} t={}us",
+                    "ps2 kbd frame: kind={} data=0x{:02X} parity_ok={} framing_ok={} glitches={} t={}us",
+                    frame.kind,
                     frame.data,
                     frame.parity_ok,
                     frame.framing_ok,
                     frame.timing.glitch_count,
                     frame.start_timestamp_us,
                 );
+
+                if let Some(ev) = classifier.ingest_kbd_frame(&frame) {
+                    match ev {
+                        ClassifierEvent::Detected(class) => {
+                            defmt::info!("ps2 classifier: Detected({})", class);
+                        }
+                        ClassifierEvent::Reset => {
+                            defmt::info!("ps2 classifier: Reset (host re-classifying)");
+                        }
+                    }
+                }
             }
 
             t_us += 1;

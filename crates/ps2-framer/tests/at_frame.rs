@@ -5,7 +5,7 @@
 //! uses an 80 µs nominal bit time (40 µs CLK low + 40 µs CLK high), which
 //! sits in the middle of the spec'd 10–16.7 kHz range.
 
-use vintage_kvm_ps2_framer::{Framer, Ps2Frame, GLITCH_THRESHOLD_US, IDLE_TIMEOUT_US};
+use vintage_kvm_ps2_framer::{FrameKind, Framer, Ps2Frame, GLITCH_THRESHOLD_US, IDLE_TIMEOUT_US};
 
 const BIT_HALF_US: u32 = 40;
 const POST_FRAME_IDLE_US: u32 = (IDLE_TIMEOUT_US + 50) as u32;
@@ -98,6 +98,7 @@ fn at_round_trip_0x55() {
     let mut f = Framer::new();
     let (_, frame) = drive_at(&mut f, 0x55, 0);
     let frame = frame.expect("frame should emit");
+    assert_eq!(frame.kind, FrameKind::At);
     assert_eq!(frame.data, 0x55);
     assert!(frame.parity_ok);
     assert!(frame.framing_ok);
@@ -215,6 +216,7 @@ fn xt_round_trip_0x55() {
     let mut f = Framer::new();
     let (_, frame) = drive_xt(&mut f, 0x55, 0);
     let frame = frame.expect("XT frame should emit on timeout");
+    assert_eq!(frame.kind, FrameKind::Xt);
     assert_eq!(frame.data, 0x55);
     assert!(frame.framing_ok);
 }
@@ -253,6 +255,7 @@ fn partial_frame_times_out_as_framing_error() {
     let mut f = Framer::new();
     let (_, frame) = drive_frame(&mut f, &bits, 0);
     let frame = frame.expect("partial frame should still emit");
+    assert_eq!(frame.kind, FrameKind::Invalid);
     assert!(!frame.framing_ok);
 }
 
