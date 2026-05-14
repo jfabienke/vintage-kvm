@@ -157,7 +157,7 @@ impl KbdOversampler {
 
         // Arm DMA AFTER the SM is enabled so the very first sample lands
         // in the ring.
-        let ring = ring_dma::arm(dma_ch);
+        let ring = ring_dma::arm_kbd(dma_ch);
 
         Self { sm0, ring }
     }

@@ -28,7 +28,6 @@
 
 use defmt::info;
 use embassy_executor::Spawner;
-use embassy_rp::gpio::{Level, Output};
 use embassy_rp::pio::Pio;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -45,6 +44,7 @@ use lifecycle::SupervisorState;
 use lpt::compat::SppNibblePhy;
 use lpt::pio_compat_in::PioCompatIn;
 use lpt::pio_nibble_out::PioNibbleOut;
+use ps2::tx::{AuxTx, KbdTx};
 use protocol::{handle_packet, DispatchOutcome, SessionState};
 use telemetry::{DefmtEmit, Event, TelemetryEmit};
 use transport::{LptTransport, Transport};
@@ -79,33 +79,42 @@ async fn main(spawner: Spawner) {
         protocol::stage_blobs::stage2_crc32()
     );
 
-    // GP7 = on-board red LED (status heartbeat).
-    let led = Output::new(p.PIN_7, Level::Low);
-    spawner.spawn(status::heartbeat::run(led).expect("spawn heartbeat"));
-
     // GP21 = NeoPixel WS2812 (visible supervisor lifecycle indicator).
     // Owns PIO2 SM0 + DMA_CH0 per docs/pico_firmware_design.md §4.2.
+    // We rely on the NeoPixel for visual status; the old GP7 red-LED
+    // heartbeat was dropped to free GP7 for the AUX oversampler's
+    // width-4 sample window (GP6/7/8/9).
     spawner
         .spawn(status::neopixel::run(p.PIO2, p.PIN_21, p.DMA_CH0).expect("spawn neopixel"));
 
-    // PIO1 hosts both PS/2 KBD state machines:
-    //   SM0 = ps2_kbd_oversample  (1 MS/s wire instrumentation)
-    //   SM1 = ps2_kbd_tx          (device→host frame emitter)
-    // GP3 (CLK_PULL) is read by SM0 for instrumentation AND driven by SM1
-    // when emitting a frame — that's intentional per
+    // PIO1 hosts all four PS/2 state machines:
+    //   SM0 = ps2_kbd_oversample  (KBD wire instrumentation, GP2/3/4)
+    //   SM1 = ps2_kbd_tx          (KBD TX, GP3=CLK_PULL, GP5=DATA_PULL)
+    //   SM2 = ps2_aux_oversample  (AUX wire instrumentation, GP6/7/8/9)
+    //   SM3 = ps2_aux_tx          (AUX TX, GP28=CLK_PULL, GP10=DATA_PULL)
+    // GP3 and GP28 (CLK_PULL pins) are read by the oversamplers for
+    // instrumentation AND driven by the TX SMs — intentional per
     // docs/pio_state_machines_design.md §6.1.
     let Pio {
         common: mut pio1_common,
         sm0: pio1_sm0,
         sm1: pio1_sm1,
+        sm2: pio1_sm2,
+        sm3: pio1_sm3,
         ..
     } = Pio::new(p.PIO1, ps2::Pio1Irqs);
     let kbd_clk_in = pio1_common.make_pio_pin(p.PIN_2);
     let kbd_clk_pull = pio1_common.make_pio_pin(p.PIN_3);
     let kbd_data_in = pio1_common.make_pio_pin(p.PIN_4);
     let kbd_data_pull = pio1_common.make_pio_pin(p.PIN_5);
+    let aux_clk_in = pio1_common.make_pio_pin(p.PIN_6);
+    let aux_gap0 = pio1_common.make_pio_pin(p.PIN_7);
+    let aux_gap1 = pio1_common.make_pio_pin(p.PIN_8);
+    let aux_data_in = pio1_common.make_pio_pin(p.PIN_9);
+    let aux_data_pull = pio1_common.make_pio_pin(p.PIN_10);
+    let aux_clk_pull = pio1_common.make_pio_pin(p.PIN_28);
 
-    let oversampler = ps2::oversampler::KbdOversampler::new(
+    let kbd_oversampler = ps2::oversampler::KbdOversampler::new(
         &mut pio1_common,
         pio1_sm0,
         &kbd_clk_in,
@@ -113,14 +122,32 @@ async fn main(spawner: Spawner) {
         &kbd_data_in,
         p.DMA_CH1,
     );
-    let _kbd_tx = ps2::tx_kbd::KbdTx::new(
+    let _kbd_tx = KbdTx::new(
         &mut pio1_common,
         pio1_sm1,
         &kbd_clk_pull,
         &kbd_data_pull,
+        "kbd",
+    );
+    let aux_oversampler = ps2::aux_oversampler::AuxOversampler::new(
+        &mut pio1_common,
+        pio1_sm2,
+        &aux_clk_in,
+        &aux_gap0,
+        &aux_gap1,
+        &aux_data_in,
+        p.DMA_CH2,
+    );
+    let _aux_tx = AuxTx::new(
+        &mut pio1_common,
+        pio1_sm3,
+        &aux_clk_pull,
+        &aux_data_pull,
+        "aux",
     );
 
-    spawner.spawn(ps2::oversampler::run(oversampler).expect("spawn ps2 kbd oversampler"));
+    spawner.spawn(ps2::oversampler::run(kbd_oversampler).expect("spawn ps2 kbd oversampler"));
+    spawner.spawn(ps2::aux_oversampler::run(aux_oversampler).expect("spawn ps2 aux oversampler"));
 
     // PIO0 hosts both LPT SPP-nibble state machines:
     //   SM0 = lpt_compat_in   (forward: host → Pico, 9-bit capture)

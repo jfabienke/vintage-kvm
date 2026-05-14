@@ -1,9 +1,10 @@
-//! PS/2 keyboard TX path — device-to-host frame emitter.
+//! PS/2 TX path — device-to-host frame emitter.
 //!
-//! Implements `ps2_kbd_tx` from `docs/pio_state_machines_design.md` §9 on
-//! PIO1 SM1. The PIO program drives CLK_PULL (GP3) via `set pins` and
-//! DATA_PULL (GP5) via `mov pins`, both at 100 kHz PIO clock → 80 µs/bit
-//! (12.5 kHz wire rate, mid-band of the PS/2 spec).
+//! Generic over PIO1 SM index so the same program drives both the
+//! keyboard side (SM1, GP3/GP5) and the AUX/mouse side (SM3, GP28/GP10).
+//! Per `docs/pio_state_machines_design.md` §9, the program drives
+//! CLK_PULL via `set pins` and DATA_PULL via `mov pins`, both at 100 kHz
+//! PIO clock → 80 µs/bit (12.5 kHz wire rate, mid-band of the PS/2 spec).
 //!
 //! ```text
 //! .program ps2_kbd_tx
@@ -60,11 +61,11 @@ const AT_LOOP_INIT: u8 = 10;
 /// XT frame is 9 bits.
 const XT_LOOP_INIT: u8 = 8;
 
-pub struct TxKbdProgram<'d> {
+pub struct TxProgram<'d> {
     prg: LoadedProgram<'d, PIO1>,
 }
 
-impl<'d> TxKbdProgram<'d> {
+impl<'d> TxProgram<'d> {
     pub fn new(common: &mut Common<'d, PIO1>) -> Self {
         let mut a: pio::Assembler<32> = pio::Assembler::new();
         let mut wrap_target = a.label();
@@ -104,30 +105,32 @@ impl<'d> TxKbdProgram<'d> {
     }
 }
 
-pub struct KbdTx {
-    sm1: StateMachine<'static, PIO1, 1>,
+pub struct Tx<const SM: usize> {
+    sm: StateMachine<'static, PIO1, SM>,
+    label: &'static str,
 }
 
-impl KbdTx {
+impl<const SM: usize> Tx<SM> {
     pub fn new(
         common: &mut Common<'static, PIO1>,
-        mut sm1: StateMachine<'static, PIO1, 1>,
+        mut sm: StateMachine<'static, PIO1, SM>,
         clk_pull: &Pin<'static, PIO1>,
         data_pull: &Pin<'static, PIO1>,
+        label: &'static str,
     ) -> Self {
         // Idle both lines HIGH (release through the open-drain buffer)
         // before flipping pindirs to Out, so the wire never glitches LOW
         // during init.
-        sm1.set_pins(Level::High, &[clk_pull, data_pull]);
-        sm1.set_pin_dirs(Direction::Out, &[clk_pull, data_pull]);
+        sm.set_pins(Level::High, &[clk_pull, data_pull]);
+        sm.set_pin_dirs(Direction::Out, &[clk_pull, data_pull]);
 
-        let program = TxKbdProgram::new(common);
+        let program = TxProgram::new(common);
 
         let mut cfg = Config::default();
         cfg.use_program(&program.prg, &[]);
-        // SET_BASE = CLK_PULL (GP3), 1 bit wide.
+        // SET_BASE = CLK_PULL, 1 bit wide.
         cfg.set_set_pins(&[clk_pull]);
-        // OUT_BASE = DATA_PULL (GP5), 1 bit wide. `mov pins, x` writes to
+        // OUT_BASE = DATA_PULL, 1 bit wide. `mov pins, x` writes to
         // OUT pins; `out pins, N` would too. Both honor `out_count`.
         cfg.set_out_pins(&[data_pull]);
 
@@ -141,15 +144,17 @@ impl KbdTx {
             direction: ShiftDirection::Right,
         };
 
-        sm1.set_config(&cfg);
-        sm1.set_enable(true);
+        sm.set_config(&cfg);
+        sm.set_enable(true);
 
         defmt::info!(
-            "ps2 kbd tx armed: PIO1 SM1, GP3=CLK_PULL GP5=DATA_PULL, {} kHz wire-rate",
+            "ps2 {} tx armed: PIO1 SM{}, {} kHz wire-rate",
+            label,
+            SM,
             PIO_CLK_HZ / 80
         );
 
-        Self { sm1 }
+        Self { sm, label }
     }
 
     /// Send one AT/PS-2 byte. Blocks until the TX FIFO accepts the packed
@@ -157,8 +162,9 @@ impl KbdTx {
     /// µs). A subsequent `send_at_byte` call queues behind it in the
     /// FIFO; the wire timing is enforced by the PIO program.
     pub async fn send_at_byte(&mut self, byte: u8) {
+        let _ = self.label; // silence unused-field warning
         let frame = pack_at_frame(byte);
-        self.sm1.tx().wait_push(frame).await;
+        self.sm.tx().wait_push(frame).await;
     }
 
     /// Send one XT byte (9-bit frame, no parity). Mode selection happens
@@ -177,11 +183,16 @@ impl KbdTx {
         // is guaranteed stalled on `pull block` because the TX FIFO has
         // been empty (caller serializes sends).
         unsafe {
-            self.sm1.exec_instr(set_y_xt);
+            self.sm.exec_instr(set_y_xt);
         }
-        self.sm1.tx().wait_push(frame).await;
+        self.sm.tx().wait_push(frame).await;
     }
 }
+
+/// AT/PS-2 keyboard TX on PIO1 SM1 (GP3=CLK_PULL, GP5=DATA_PULL).
+pub type KbdTx = Tx<1>;
+/// AT/PS-2 mouse/AUX TX on PIO1 SM3 (GP28=CLK_PULL, GP10=DATA_PULL).
+pub type AuxTx = Tx<3>;
 
 // Frame packing lives in `crates/ps2-framer::packer` — see that crate's
 // tests/packer.rs for the layout + round-trip coverage.

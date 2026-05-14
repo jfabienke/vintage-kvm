@@ -19,9 +19,10 @@
 
 #![allow(dead_code)] // Phase 1 scaffold; concrete impls are placeholders.
 
+pub mod aux_oversampler;
 pub mod oversampler;
 pub mod ring_dma;
-pub mod tx_kbd;
+pub mod tx;
 
 // Single PIO1 IRQ binding shared by both PIO1 state machines (oversampler
 // on SM0, KBD TX on SM1). embassy's bind_interrupts! disallows re-binding
