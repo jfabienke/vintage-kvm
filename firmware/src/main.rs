@@ -42,7 +42,7 @@ mod telemetry;
 mod transport;
 mod util;
 
-use crc_sniffer::SnifferCrc32;
+use crc_sniffer::DmaSniffer;
 use lifecycle::SupervisorState;
 use lpt::compat::SppNibblePhy;
 use lpt::pio_compat_in::PioCompatIn;
@@ -78,18 +78,26 @@ async fn main(spawner: Spawner) {
         phase: 3,
     });
 
-    // DMA-sniffer CRC-32 engine. Run the standard test vector at boot
-    // so a misconfigured sniffer fails loudly, then compute the Stage 2
-    // image CRC via the same hardware path.
-    let mut sniffer = SnifferCrc32::new(p.DMA_CH5);
-    let selftest = sniffer.compute(b"123456789");
+    // DMA-sniffer CRC engines (CRC-32 + CRC-16 over DMA_CH5). Run the
+    // standard test vectors at boot so a misconfigured sniffer fails
+    // loudly, then compute the Stage 2 image CRC via the same hardware
+    // path.
+    let mut sniffer = DmaSniffer::new(p.DMA_CH5);
+    let crc32_selftest = sniffer.compute_crc32(b"123456789");
     defmt::assert_eq!(
-        selftest,
+        crc32_selftest,
         0xCBF43926u32,
-        "DMA sniffer self-test failed; expected 0xCBF43926, got {:#010X}",
-        selftest
+        "CRC-32 sniffer self-test failed; expected 0xCBF43926, got {:#010X}",
+        crc32_selftest
     );
-    let stage2_crc = sniffer.compute(STAGE2_PLACEHOLDER);
+    let crc16_selftest = sniffer.compute_crc16(b"123456789");
+    defmt::assert_eq!(
+        crc16_selftest,
+        0x29B1u16,
+        "CRC-16 sniffer self-test failed; expected 0x29B1, got {:#06X}",
+        crc16_selftest
+    );
+    let stage2_crc = sniffer.compute_crc32(STAGE2_PLACEHOLDER);
     let stage2_blob = EmbeddedStage2::with_crc(stage2_crc);
     info!(
         "stage2 placeholder: {} bytes, CRC-32 = 0x{:08X} (hw)",

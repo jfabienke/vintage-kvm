@@ -1,19 +1,31 @@
-//! DMA-sniffer-backed [`Crc32Engine`].
+//! RP2350 DMA Sniffer — hardware-accelerated CRC-16 + CRC-32 engines.
 //!
-//! Configures the RP2350 DMA Sniffer in CRC-32R mode (bit-reversed input
-//! + reflected polynomial 0xEDB88320) with `out_rev` and `out_inv` set
-//! so the result matches the reflected/inverted CRC-32/IEEE used by zlib,
-//! PNG, and the Stage 1 host-side `crc32_*` routines.
+//! Shares DMA_CH5 between both algorithms. Each `compute_*` call:
+//!   1. Configures `SNIFF_CTRL` for the right `Calc` mode + output
+//!      transforms.
+//!   2. Seeds `SNIFF_DATA` with the algorithm's INIT value.
+//!   3. Kicks DMA_CH5 to memcopy the slice through the sniffer at
+//!      `treq_sel = PERMANENT` (memory-bus speed).
+//!   4. Reads `SNIFF_DATA`; the read-side `out_rev` / `out_inv`
+//!      transforms (if any) apply on-the-fly.
 //!
-//! Mechanism: DMA_CH5 reads from the input slice and writes to a discard
-//! sink at memory-bus speed (`treq_sel = PERMANENT`). Each byte flows
-//! through the sniffer hardware, which updates the SNIFF_DATA register.
-//! `out_rev` and `out_inv` only transform on read; the internal
-//! accumulator stays raw, so back-to-back `update()` calls chain
-//! naturally.
+//! Both engines are validated at boot against their canonical test
+//! vector — `compute("123456789")` = 0xCBF43926 (CRC-32) / 0x29B1
+//! (CRC-16-CCITT/FALSE).
 //!
-//! Verified against the standard test vector
-//! `compute(b"123456789") == 0xCBF43926` at boot.
+//! ## Mode mapping vs the protocol crate's software impls
+//!
+//! | Algorithm  | Calc      | Init      | out_rev | out_inv | Match against        |
+//! |------------|-----------|-----------|---------|---------|----------------------|
+//! | CRC-32/IEEE| CRC32R    | 0xFFFFFFFF| true    | true    | `crc32::compute`     |
+//! | CRC-16-CCITT/FALSE | CRC16 | 0xFFFF | false   | false   | `crc16::compute`     |
+//!
+//! CRC-32 is "reflected" (input bit-reversed, output bit-reversed,
+//! final XOR = 0xFFFFFFFF) — the variant used by zlib/PNG/IEEE 802.3
+//! and Stage 1's host-side `crc32_*` routines.
+//!
+//! CRC-16-CCITT is "FALSE" (no reflection, no final XOR) — the variant
+//! used by every packet CRC in our wire protocol.
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
@@ -21,98 +33,98 @@ use embassy_rp::Peri;
 use embassy_rp::pac;
 use embassy_rp::pac::dma::vals::{Calc, DataSize, TransCountMode, TreqSel};
 use embassy_rp::peripherals::DMA_CH5;
-use vintage_kvm_protocol::packet::crc32;
-use vintage_kvm_protocol::Crc32Engine;
 
 const DMA_CH_NUM: usize = 5;
+
+const CRC32_INIT: u32 = 0xFFFF_FFFF;
+const CRC16_INIT: u32 = 0x0000_FFFF;
 
 /// Discard sink for the memcopy. DMA writes here; CPU never reads it.
 #[repr(C, align(4))]
 struct Sink(u32);
 static mut DISCARD: Sink = Sink(0);
 
-pub struct SnifferCrc32 {
-    // Consumed as an ownership marker — actual register access goes
-    // through pac.
+/// Owns DMA_CH5 and the shared sniffer-control register. Both CRC
+/// engines route through it.
+pub struct DmaSniffer {
     _dma: Peri<'static, DMA_CH5>,
 }
 
-impl SnifferCrc32 {
-    /// Initialize the sniffer in CRC-32R mode with output reflection +
-    /// inversion enabled. Seeds SNIFF_DATA with the standard CRC-32
-    /// initial value (0xFFFFFFFF) so a first `update()` call after
-    /// construction starts from a clean accumulator.
+impl DmaSniffer {
+    /// Claim DMA_CH5 for the sniffer. The actual sniffer setup happens
+    /// per `compute_*` call so multiple algorithms can share one
+    /// channel without leaking state between calls.
     pub fn new(dma_ch: Peri<'static, DMA_CH5>) -> Self {
-        pac::DMA.sniff_ctrl().write(|w| {
-            w.set_en(false);
-            w.set_dmach(DMA_CH_NUM as u8);
-            w.set_calc(Calc::CRC32R);
-            w.set_bswap(false);
-            w.set_out_rev(true);
-            w.set_out_inv(true);
-        });
-        pac::DMA.sniff_data().write_value(crc32::INIT);
         Self { _dma: dma_ch }
     }
 
-    /// One-shot computation. Equivalent to `reset() + update(data) + finalize()`.
-    pub fn compute(&mut self, data: &[u8]) -> u32 {
-        self.reset();
-        self.update(data);
-        self.finalize()
+    /// One-shot CRC-32/IEEE reflected over `data`. Matches
+    /// [`vintage_kvm_protocol::packet::crc32::compute`].
+    pub fn compute_crc32(&mut self, data: &[u8]) -> u32 {
+        configure(Calc::CRC32R, true, true);
+        pac::DMA.sniff_data().write_value(CRC32_INIT);
+        if !data.is_empty() {
+            run(data);
+        }
+        pac::DMA.sniff_data().read()
+    }
+
+    /// One-shot CRC-16-CCITT/FALSE over `data`. Matches
+    /// [`vintage_kvm_protocol::packet::crc16::compute`].
+    pub fn compute_crc16(&mut self, data: &[u8]) -> u16 {
+        configure(Calc::CRC16, false, false);
+        pac::DMA.sniff_data().write_value(CRC16_INIT);
+        if !data.is_empty() {
+            run(data);
+        }
+        (pac::DMA.sniff_data().read() & 0xFFFF) as u16
     }
 }
 
-impl Crc32Engine for SnifferCrc32 {
-    fn reset(&mut self) {
-        pac::DMA.sniff_data().write_value(crc32::INIT);
-    }
+fn configure(calc: Calc, out_rev: bool, out_inv: bool) {
+    pac::DMA.sniff_ctrl().write(|w| {
+        w.set_en(false);
+        w.set_dmach(DMA_CH_NUM as u8);
+        w.set_calc(calc);
+        w.set_bswap(false);
+        w.set_out_rev(out_rev);
+        w.set_out_inv(out_inv);
+    });
+}
 
-    fn update(&mut self, data: &[u8]) {
-        if data.is_empty() {
-            return;
-        }
+fn run(data: &[u8]) {
+    let ch = pac::DMA.ch(DMA_CH_NUM);
+    let read_addr = data.as_ptr() as u32;
+    // DMA always writes the same dummy address; CPU never reads it.
+    let write_addr = core::ptr::addr_of_mut!(DISCARD) as u32;
 
-        let ch = pac::DMA.ch(DMA_CH_NUM);
-        let read_addr = data.as_ptr() as u32;
-        // DMA always writes the same dummy address; CPU never reads
-        // DISCARD's value.
-        let write_addr = core::ptr::addr_of_mut!(DISCARD) as u32;
+    ch.read_addr().write_value(read_addr);
+    ch.write_addr().write_value(write_addr);
+    ch.trans_count().write(|w| {
+        w.set_mode(TransCountMode::NORMAL);
+        w.set_count(data.len() as u32);
+    });
 
-        ch.read_addr().write_value(read_addr);
-        ch.write_addr().write_value(write_addr);
-        ch.trans_count().write(|w| {
-            w.set_mode(TransCountMode::NORMAL);
-            w.set_count(data.len() as u32);
-        });
+    pac::DMA.sniff_ctrl().modify(|w| w.set_en(true));
 
-        pac::DMA.sniff_ctrl().modify(|w| w.set_en(true));
+    compiler_fence(Ordering::SeqCst);
 
-        compiler_fence(Ordering::SeqCst);
+    ch.ctrl_trig().write(|w| {
+        w.set_treq_sel(TreqSel::PERMANENT);
+        w.set_data_size(DataSize::SIZE_BYTE);
+        w.set_incr_read(true);
+        w.set_incr_write(false);
+        w.set_chain_to(DMA_CH_NUM as u8);
+        w.set_bswap(false);
+        w.set_en(true);
+    });
 
-        ch.ctrl_trig().write(|w| {
-            w.set_treq_sel(TreqSel::PERMANENT);
-            w.set_data_size(DataSize::SIZE_BYTE);
-            w.set_incr_read(true);
-            w.set_incr_write(false);
-            w.set_chain_to(DMA_CH_NUM as u8);
-            w.set_bswap(false);
-            w.set_en(true);
-        });
+    // Spin until completion. At ~150 MHz bus speed this is ~1 µs per
+    // ~150 bytes — well below any sleep cadence, so a busy loop is the
+    // right choice.
+    while ch.ctrl_trig().read().busy() {}
 
-        // Spin until the transfer completes. At ~150 MHz bus speed this
-        // is ~1 µs per ~150 bytes — well below any sleep cadence, so a
-        // busy loop is the right choice.
-        while ch.ctrl_trig().read().busy() {}
+    pac::DMA.sniff_ctrl().modify(|w| w.set_en(false));
 
-        pac::DMA.sniff_ctrl().modify(|w| w.set_en(false));
-
-        compiler_fence(Ordering::SeqCst);
-    }
-
-    fn finalize(&self) -> u32 {
-        // SNIFF_DATA returns the raw accumulator with out_rev + out_inv
-        // applied as the read transform — that's the final CRC-32.
-        pac::DMA.sniff_data().read()
-    }
+    compiler_fence(Ordering::SeqCst);
 }
