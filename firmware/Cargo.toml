@@ -42,3 +42,9 @@ cortex-m-rt = "0.7.0"
 
 # WS2812 RGB8 type used by embassy-rp's PioWs2812 driver.
 smart-leds = { version = "0.4", default-features = false }
+
+# PIO program assembly + fixed-point clkdiv math (both already in
+# embassy-rp's dep graph; named explicitly here so our own PIO programs
+# can call into them).
+pio = { version = "0.3", default-features = false }
+fixed = { version = "1.28", default-features = false }

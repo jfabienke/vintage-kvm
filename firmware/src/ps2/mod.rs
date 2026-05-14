@@ -18,6 +18,8 @@
 
 #![allow(dead_code)] // Phase 1 scaffold; concrete impls are placeholders.
 
+pub mod oversampler;
+
 pub use vintage_kvm_signatures::MachineClass;
 #[allow(unused_imports)] // exposed for Phase 1 classifier
 pub use vintage_kvm_signatures::KeyboardFeatures;

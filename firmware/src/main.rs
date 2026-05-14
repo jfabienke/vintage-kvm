@@ -85,6 +85,13 @@ async fn main(spawner: Spawner) {
     spawner
         .spawn(status::neopixel::run(p.PIO2, p.PIN_21, p.DMA_CH0).expect("spawn neopixel"));
 
+    // PS/2 KBD wire oversampler — passive, always-on. PIO1 SM0, GP2/3/4.
+    // Phase 1 bringup: counters update; frame extractor lands next.
+    spawner.spawn(
+        ps2::oversampler::run(p.PIO1, p.PIN_2, p.PIN_3, p.PIN_4)
+            .expect("spawn ps2 kbd oversampler"),
+    );
+
     // LPT pin allocation per `docs/hardware_reference.md` §3.3 and
     // `docs/pico_phase3_design.md`. nInit (host strobe) routing TBD;
     // GP11 used as the placeholder for now (flagged in lpt::compat).
