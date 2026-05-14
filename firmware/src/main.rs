@@ -122,6 +122,8 @@ async fn main(spawner: Spawner) {
     spawner.spawn(usb::run_device(usb_stack.device).expect("spawn usb device"));
     spawner.spawn(usb::events::run(usb_stack.events).expect("spawn usb events writer"));
     spawner.spawn(usb::control::run(usb_stack.control).expect("spawn usb control"));
+    spawner.spawn(usb::bulk::run_writer(usb_stack.bulk_in).expect("spawn usb bulk writer"));
+    spawner.spawn(usb::bulk::run_reader(usb_stack.bulk_out).expect("spawn usb bulk reader"));
 
     // PIO1 hosts all four PS/2 state machines:
     //   SM0 = ps2_kbd_oversample  (KBD wire instrumentation, GP2/3/4)

@@ -17,6 +17,9 @@
 //!   the AUX wire. Deltas clamp to 9-bit signed (-256..=255).
 //! - `mouse_button l|r|m up|down` → press / release a mouse button.
 //!   Button state is sticky across move commands.
+//! - `bulk_test [text]` → enqueue a `BulkKind::Test` frame on the
+//!   vendor bulk IN endpoint. Default payload is `"hello"`; with an
+//!   argument, the rest of the line is the payload.
 //! - everything else → `err unknown verb: <name>`
 //!
 //! Future verbs (`dump_ring`, `set`, …) plug in by adding arms to
@@ -36,6 +39,7 @@ use crate::ps2::aux_oversampler::AUX_COUNTERS;
 use crate::ps2::injector::{INJECT_RAW, INJECT_RAW_MAX};
 use crate::ps2::mouse_input::{MouseBtn, MouseCmd, MOUSE_CMD};
 use crate::ps2::oversampler::{KBD_COUNTERS, KBD_SELF_TX_FRAMES};
+use crate::usb::bulk::{build_frame, next_seq, BulkKind, BULK_OUT};
 use crate::usb::events::USB_EVENT_DROPS;
 
 /// Inbound buffer: we accept ASCII commands up to one line.
@@ -99,6 +103,7 @@ async fn dispatch(line: &str, class: &mut CdcAcmClass<'static, Driver<'static, U
         "inject" => handle_inject(parts, class).await,
         "mouse_move" => handle_mouse_move(parts, class).await,
         "mouse_button" => handle_mouse_button(parts, class).await,
+        "bulk_test" => handle_bulk_test(trimmed, class).await,
         other => {
             let mut out: String<64> = String::new();
             let _ = write!(out, "err unknown verb: {other}");
@@ -196,6 +201,33 @@ async fn handle_mouse_button(
         return;
     }
     let _ = send_line(class, "ok").await;
+}
+
+async fn handle_bulk_test(
+    line: &str,
+    class: &mut CdcAcmClass<'static, Driver<'static, USB>>,
+) {
+    // Strip the verb itself; whatever remains (possibly empty) is the
+    // payload. Default to b"hello" so a bare `bulk_test` is the
+    // simplest smoke test.
+    let rest = line.strip_prefix("bulk_test").unwrap_or("").trim_start();
+    let payload: &[u8] = if rest.is_empty() { b"hello" } else { rest.as_bytes() };
+
+    let frame = match build_frame(BulkKind::Test, next_seq(), payload) {
+        Ok(f) => f,
+        Err(()) => {
+            let _ = send_line(class, "err bulk_test payload too long").await;
+            return;
+        }
+    };
+    let len = frame.len();
+    if BULK_OUT.try_send(frame).is_err() {
+        let _ = send_line(class, "err bulk queue full").await;
+        return;
+    }
+    let mut out: String<48> = String::new();
+    let _ = write!(out, "ok bulk queued {len}B");
+    let _ = send_line(class, &out).await;
 }
 
 async fn send_stats(class: &mut CdcAcmClass<'static, Driver<'static, USB>>) -> Result<(), EndpointError> {

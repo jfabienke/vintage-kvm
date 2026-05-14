@@ -1,16 +1,22 @@
-//! USB device stack. Composite device with one CDC ACM `events`
-//! interface for Phase 4a per `docs/usb_interface_design.md`; the
-//! `control`, `console`, and vendor-bulk interfaces land in later
-//! phases on top of the same `Builder`.
+//! USB device stack. Composite device with three landed interfaces
+//! per `docs/usb_interface_design.md`:
+//!
+//! - `events`  — CDC ACM IN-only telemetry stream (Phase 4a).
+//! - `control` — CDC ACM bidirectional RPC (Phase 4b).
+//! - `bulk`    — vendor-class bulk IN+OUT for blobs (Phase 6).
+//!
+//! The `console` CDC slot is left for Phase 5 and plugs onto the same
+//! `Builder` when it lands.
 
 use embassy_rp::Peri;
 use embassy_rp::bind_interrupts;
 use embassy_rp::peripherals::USB;
-use embassy_rp::usb::{Driver, InterruptHandler};
+use embassy_rp::usb::{Driver, Endpoint, In, InterruptHandler, Out};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcState};
 use embassy_usb::{Builder, Config, UsbDevice};
 use static_cell::StaticCell;
 
+pub mod bulk;
 pub mod control;
 pub mod events;
 
@@ -53,12 +59,15 @@ impl UsbResources {
 
 static RESOURCES: StaticCell<UsbResources> = StaticCell::new();
 
-/// Composite USB device plus the two CDC class instances landed in
-/// Phase 4: events (IN-only telemetry) and control (bidirectional RPC).
+/// Composite USB device plus the class / endpoint handles landed
+/// today: events (IN-only CDC telemetry), control (bidirectional CDC
+/// RPC), and the vendor bulk IN/OUT pair.
 pub struct UsbStack {
     pub device: UsbDevice<'static, UsbDriver>,
     pub events: CdcAcmClass<'static, UsbDriver>,
     pub control: CdcAcmClass<'static, UsbDriver>,
+    pub bulk_in: Endpoint<'static, USB, In>,
+    pub bulk_out: Endpoint<'static, USB, Out>,
 }
 
 /// Build the composite USB device + both CDC class instances. The
@@ -95,11 +104,27 @@ pub fn build(usb: Peri<'static, USB>) -> UsbStack {
     let events_class = CdcAcmClass::new(&mut builder, &mut r.events_state, 64);
     let control_class = CdcAcmClass::new(&mut builder, &mut r.control_state, 64);
 
+    // Vendor-class function for the bulk interface. Class 0xFF
+    // (vendor-specific) lets libusb / WinUSB claim it; the host picks
+    // up the IAD because composite_with_iads is set above. v1 advertises
+    // one alt setting with one bulk IN + one bulk OUT endpoint, both
+    // 64-byte FS max packet size.
+    let (bulk_in, bulk_out) = {
+        let mut func = builder.function(0xFF, 0x00, 0x00);
+        let mut iface = func.interface();
+        let mut alt = iface.alt_setting(0xFF, 0x00, 0x00, None);
+        let ep_in = alt.endpoint_bulk_in(None, 64);
+        let ep_out = alt.endpoint_bulk_out(None, 64);
+        (ep_in, ep_out)
+    };
+
     let device = builder.build();
     UsbStack {
         device,
         events: events_class,
         control: control_class,
+        bulk_in,
+        bulk_out,
     }
 }
 
