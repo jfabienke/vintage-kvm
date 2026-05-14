@@ -1,8 +1,10 @@
 //! vintage-kvm CDC telemetry schema + emission trait.
 //!
-//! Newline-delimited JSON events emitted by the firmware on CDC interface 1
-//! and consumed by host-side tooling (the `tools/tui/` dashboard, log
-//! aggregators, etc.). Full event taxonomy and command set:
+//! Events emitted by the firmware over the `events` CDC ACM interface
+//! (`docs/usb_interface_design.md` §4.1), wire-encoded as postcard +
+//! COBS-framed bytes by `firmware/src/usb/events.rs`. Consumed host-side
+//! by `tools/events-consumer/` and (later) the TUI dashboard. Full
+//! event taxonomy and command set:
 //! [`docs/instrumentation_surface.md` §5](https://github.com/jfabienke/vintage-kvm/blob/master/docs/instrumentation_surface.md).
 //!
 //! The trait `TelemetryEmit` is the firmware-side abstraction: every layer
@@ -14,13 +16,21 @@
 //! cover boot, seq gap, unknown cmd, encode error; PS/2 (frame, stats,
 //! anomaly, fingerprint) lands at Phase 1.
 //!
+//! ## Wire format
+//!
+//! postcard's externally-tagged enum representation: a varint variant
+//! index followed by the variant's fields. Deliberately *not* using
+//! `serde(tag = "kind")` — that forces a self-describing map shape and
+//! postcard doesn't support `deserialize_any`, so round-trip wouldn't
+//! work.
+//!
 //! ## Feature `serde`
 //!
-//! Enables `Serialize` derives (firmware → JSON line over CDC). `Deserialize`
-//! is **not** derived here — it requires `alloc` for the tag-content
-//! representation we use, and the firmware never deserializes its own
-//! events. The host-side TUI gets `Deserialize` via a `tools/tui/` mirror
-//! crate or a `serde-de` feature once we need it.
+//! Enables `Serialize` derives only. `Deserialize` isn't derived here
+//! because `Event::Boot` carries `&'static str` (firmware passes
+//! program literals), which has no generic deserialize impl. Host
+//! consumers mirror the schema with owned-string variants — see
+//! `tools/events-consumer`.
 
 #![no_std]
 
@@ -77,7 +87,6 @@ pub enum PlaneState {
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(tag = "kind", rename_all = "snake_case"))]
 pub enum Event {
     /// Firmware boot. `t` is seconds since power-on; `phase` is the
     /// design.md §22 phase number.

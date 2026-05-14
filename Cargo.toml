@@ -6,6 +6,7 @@ members = [
     "crates/signatures",
     "crates/telemetry-schema",
     "firmware",
+    "tools/events-consumer",
 ]
 
 [workspace.package]
