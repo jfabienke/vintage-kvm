@@ -26,6 +26,13 @@ embassy-time = { version = "0.5.1", features = [
 ] }
 embassy-sync = { version = "0.8.0", features = ["defmt"] }
 embassy-futures = "0.1.2"
+embassy-usb = { version = "0.6.0", default-features = false, features = ["defmt"] }
+
+# Static-init helper for the USB stack's long-lived buffers.
+static_cell = "2.1"
+
+# COBS-framed postcard serializer for the events-CDC wire format.
+postcard = { version = "1", default-features = false }
 
 heapless = { workspace = true }
 

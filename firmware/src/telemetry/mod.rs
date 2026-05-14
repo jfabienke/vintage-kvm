@@ -18,10 +18,17 @@ pub mod multi;
 pub mod noop;
 
 pub use defmt_emit::DefmtEmit;
-#[allow(unused_imports)] // ready for Phase 4+ multi-sink wiring and tests
 pub use multi::MultiEmit;
 #[allow(unused_imports)]
 pub use noop::NoopEmit;
+
+/// Production telemetry sink: defmt-RTT (dev probe) + USB CDC events
+/// interface (operator tail). Zero-sized; pass by value everywhere.
+pub type DualEmit = MultiEmit<DefmtEmit, crate::usb::events::UsbEmit>;
+
+/// Canonical sink instance. `MultiEmit` is a public-fields tuple struct
+/// so we can build it in `const` context without a `new()`.
+pub const TELEMETRY: DualEmit = MultiEmit(DefmtEmit, crate::usb::events::UsbEmit);
 
 // Re-export for ergonomic call sites:
 //   use crate::telemetry::{Event, TelemetryEmit};

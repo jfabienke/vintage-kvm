@@ -40,6 +40,7 @@ mod ps2;
 mod status;
 mod telemetry;
 mod transport;
+mod usb;
 mod util;
 
 use crc_sniffer::DmaSniffer;
@@ -50,7 +51,7 @@ use lpt::pio_nibble_out::PioNibbleOut;
 use protocol::stage_blobs::{EmbeddedStage2, STAGE2_PLACEHOLDER};
 use ps2::tx::{AuxTx, KbdTx};
 use protocol::{handle_packet, DispatchOutcome, SessionState};
-use telemetry::{DefmtEmit, Event, TelemetryEmit};
+use telemetry::{Event, TelemetryEmit, TELEMETRY};
 use transport::{LptTransport, Transport};
 
 #[unsafe(link_section = ".bi_entries")]
@@ -70,10 +71,10 @@ const FW_VERSION: &str = env!("CARGO_PKG_VERSION");
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
-    // Telemetry sink lives for the whole program. DefmtEmit is zero-sized so
-    // we copy it freely into tasks that need to emit.
-    let telemetry = DefmtEmit;
-    telemetry.emit(Event::Boot {
+    // Telemetry sink lives for the whole program. `TELEMETRY` is a
+    // zero-sized const composite of `DefmtEmit + UsbEmit`, so events
+    // land on both the dev probe and the host's events-CDC stream.
+    TELEMETRY.emit(Event::Boot {
         fw_version: FW_VERSION,
         phase: 3,
     });
@@ -112,6 +113,13 @@ async fn main(spawner: Spawner) {
     // width-4 sample window (GP6/7/8/9).
     spawner
         .spawn(status::neopixel::run(p.PIO2, p.PIN_21, p.DMA_CH0).expect("spawn neopixel"));
+
+    // USB composite device — Phase 4a: one CDC ACM `events` interface.
+    // The `control`, `console`, and vendor-bulk interfaces will land on
+    // top of the same Builder in later phases.
+    let (usb_device, events_class) = usb::build(p.USB);
+    spawner.spawn(usb::run_device(usb_device).expect("spawn usb device"));
+    spawner.spawn(usb::events::run(events_class).expect("spawn usb events writer"));
 
     // PIO1 hosts all four PS/2 state machines:
     //   SM0 = ps2_kbd_oversample  (KBD wire instrumentation, GP2/3/4)
@@ -221,7 +229,7 @@ async fn main(spawner: Spawner) {
 
     let phy = SppNibblePhy::new(compat_in, nibble_out);
 
-    let transport = LptTransport::new(phy, DefmtEmit);
+    let transport = LptTransport::new(phy, TELEMETRY);
 
     // Phase 3 jumps straight into CAP handshake — no PS/2 detect / DEBUG
     // injection yet. The LED flips to magenta-blink once SEND_BLOCK traffic
@@ -239,8 +247,6 @@ async fn main(spawner: Spawner) {
 /// the diagnostic surface for unhealthy wires.
 async fn serve_loop<T: Transport>(mut transport: T, blob: EmbeddedStage2) -> ! {
     let mut state = SessionState::with_blob(blob);
-    let telemetry = DefmtEmit;
-
     loop {
         let pkt = match transport.recv_packet().await {
             Ok(p) => p,
@@ -254,7 +260,7 @@ async fn serve_loop<T: Transport>(mut transport: T, blob: EmbeddedStage2) -> ! {
             pkt.payload.len()
         );
 
-        match handle_packet(&pkt, &mut state, &telemetry) {
+        match handle_packet(&pkt, &mut state, &TELEMETRY) {
             DispatchOutcome::Reply(out) => {
                 let _ = transport.send_packet(&out).await;
             }
