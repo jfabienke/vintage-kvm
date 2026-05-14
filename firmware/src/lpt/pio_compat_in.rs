@@ -19,21 +19,15 @@
 //! `wait 0` just fired), bits 1..8 are D0..D7.
 
 use embassy_rp::Peri;
-use embassy_rp::bind_interrupts;
 use embassy_rp::peripherals::{
     PIN_11, PIN_12, PIN_13, PIN_14, PIN_15, PIN_16, PIN_17, PIN_18, PIN_19, PIO0,
 };
 use embassy_rp::pio::{
-    Common, Config, FifoJoin, InterruptHandler, LoadedProgram, Pio, ShiftConfig, ShiftDirection,
-    StateMachine,
+    Common, Config, FifoJoin, LoadedProgram, ShiftConfig, ShiftDirection, StateMachine,
 };
 use fixed::types::U24F8;
 
 use super::{LptError, LptMode, LptPhy};
-
-bind_interrupts!(struct Irqs {
-    PIO0_IRQ_0 => InterruptHandler<PIO0>;
-});
 
 /// 3-instruction `lpt_compat_in` program. Loops:
 ///
@@ -73,12 +67,13 @@ pub struct PioCompatIn {
 }
 
 impl PioCompatIn {
-    /// Consume PIO0 + the nine input pins (host strobe at IN_BASE, then
-    /// D0..D7) and arm the program. Pins are configured as PIO inputs;
-    /// callers must not have already wrapped them in `gpio::Input` or
-    /// driven them as outputs.
+    /// Claim PIO0 SM0 + the nine input pins (host strobe at IN_BASE,
+    /// then D0..D7) and arm the program. Pins are configured as PIO
+    /// inputs; callers must not have already wrapped them in
+    /// `gpio::Input` or driven them as outputs.
     pub fn new(
-        pio: Peri<'static, PIO0>,
+        common: &mut Common<'static, PIO0>,
+        mut sm0: StateMachine<'static, PIO0, 0>,
         strobe: Peri<'static, PIN_11>,
         d0: Peri<'static, PIN_12>,
         d1: Peri<'static, PIN_13>,
@@ -89,12 +84,6 @@ impl PioCompatIn {
         d6: Peri<'static, PIN_18>,
         d7: Peri<'static, PIN_19>,
     ) -> Self {
-        let Pio {
-            mut common,
-            mut sm0,
-            ..
-        } = Pio::new(pio, Irqs);
-
         let strobe = common.make_pio_pin(strobe);
         let d0 = common.make_pio_pin(d0);
         let d1 = common.make_pio_pin(d1);
@@ -105,7 +94,7 @@ impl PioCompatIn {
         let d6 = common.make_pio_pin(d6);
         let d7 = common.make_pio_pin(d7);
 
-        let program = CompatInProgram::new(&mut common);
+        let program = CompatInProgram::new(common);
 
         let mut cfg = Config::default();
         cfg.use_program(&program.prg, &[]);

@@ -7,6 +7,14 @@
 
 pub mod compat;
 pub mod pio_compat_in;
+pub mod pio_nibble_out;
+
+// Single PIO0 IRQ binding shared by every PIO0 SM (compat-in on SM0,
+// nibble-out on SM1). embassy's bind_interrupts! disallows re-binding the
+// same IRQ from multiple sites, so it has to live in one place.
+embassy_rp::bind_interrupts!(pub(crate) struct Pio0Irqs {
+    PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<embassy_rp::peripherals::PIO0>;
+});
 
 #[allow(dead_code)] // `Timeout` is constructed once timeouts land in Phase 4.
 #[derive(Debug, Clone, Copy, defmt::Format)]

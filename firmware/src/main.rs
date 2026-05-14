@@ -29,6 +29,7 @@
 use defmt::info;
 use embassy_executor::Spawner;
 use embassy_rp::gpio::{Level, Output};
+use embassy_rp::pio::Pio;
 use {defmt_rtt as _, panic_probe as _};
 
 mod lifecycle;
@@ -43,6 +44,7 @@ mod util;
 use lifecycle::SupervisorState;
 use lpt::compat::SppNibblePhy;
 use lpt::pio_compat_in::PioCompatIn;
+use lpt::pio_nibble_out::PioNibbleOut;
 use protocol::{handle_packet, DispatchOutcome, SessionState};
 use telemetry::{DefmtEmit, Event, TelemetryEmit};
 use transport::{LptTransport, Transport};
@@ -93,36 +95,45 @@ async fn main(spawner: Spawner) {
             .expect("spawn ps2 kbd oversampler"),
     );
 
-    // LPT forward path (DOS → Pico) via PIO0 SM0. Pin allocation per
-    // `docs/hardware_reference.md` §3.3 and `docs/pio_state_machines_design.md`
-    // §10.1: IN_BASE=GP11 (host strobe, currently nInit — flagged TBD in
-    // pio_state_machines_design.md §4.4), GP12..GP19 = D0..D7.
+    // PIO0 hosts both LPT SPP-nibble state machines:
+    //   SM0 = lpt_compat_in   (forward: host → Pico, 9-bit capture)
+    //   SM1 = lpt_nibble_out  (reverse: Pico → host, 2 × 5-bit nibble)
+    // Pin allocation per `docs/hardware_reference.md` §3.3 and
+    // `docs/pio_state_machines_design.md` §10. Host strobe is currently
+    // assumed to land on GP11 (nInit routing TBD; see pio_state_machines
+    // _design.md §4.4).
+    let Pio {
+        mut common,
+        sm0,
+        sm1,
+        ..
+    } = Pio::new(p.PIO0, lpt::Pio0Irqs);
+
     let compat_in = PioCompatIn::new(
-        p.PIO0, p.PIN_11, p.PIN_12, p.PIN_13, p.PIN_14, p.PIN_15, p.PIN_16, p.PIN_17, p.PIN_18,
+        &mut common,
+        sm0,
+        p.PIN_11,
+        p.PIN_12,
+        p.PIN_13,
+        p.PIN_14,
+        p.PIN_15,
+        p.PIN_16,
+        p.PIN_17,
+        p.PIN_18,
         p.PIN_19,
     );
 
-    // Status outputs (peripheral-driven) — nibble + phase. Still bit-bang
-    // pending `lpt_nibble_out` PIO.
-    //   bit 0 (LSB) → status[3] = nFault  = GP27
-    //   bit 1       → status[4] = Select  = GP26
-    //   bit 2       → status[5] = PError  = GP25
-    //   bit 3 (MSB) → status[6] = nAck    = GP23
-    //   phase       → status[7] = Busy    = GP24
-    let nibble_bit0 = Output::new(p.PIN_27, Level::Low);
-    let nibble_bit1 = Output::new(p.PIN_26, Level::Low);
-    let nibble_bit2 = Output::new(p.PIN_25, Level::Low);
-    let nibble_bit3 = Output::new(p.PIN_23, Level::Low);
-    let phase = Output::new(p.PIN_24, Level::Low);
-
-    let phy = SppNibblePhy::new(
-        compat_in,
-        nibble_bit0,
-        nibble_bit1,
-        nibble_bit2,
-        nibble_bit3,
-        phase,
+    let nibble_out = PioNibbleOut::new(
+        &mut common,
+        sm1,
+        p.PIN_23, // nAck    (nibble bit 3)
+        p.PIN_24, // Busy    (phase)
+        p.PIN_25, // PError  (nibble bit 2)
+        p.PIN_26, // Select  (nibble bit 1)
+        p.PIN_27, // nFault  (nibble bit 0)
     );
+
+    let phy = SppNibblePhy::new(compat_in, nibble_out);
 
     let transport = LptTransport::new(phy, DefmtEmit);
 
