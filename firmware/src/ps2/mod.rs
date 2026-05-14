@@ -13,39 +13,19 @@
 //! TX uses a separate PIO SM that bit-bangs CLK + drives DATA via the
 //! 74LVC07A open-drain buffer; one `Ps2Frame` per emit.
 //!
-//! Concrete impls land in `ps2/{oversampler.rs, demodulator.rs, tx.rs,
-//! framer.rs, classifier.rs, instrumentation.rs}` when Phase 1 lands.
+//! The wire-frame state machine lives in `crates/ps2-framer` so it can be
+//! host-tested. Re-exported here for the rest of the firmware to consume
+//! via `crate::ps2::{Framer, Ps2Frame, FrameTiming}`.
 
 #![allow(dead_code)] // Phase 1 scaffold; concrete impls are placeholders.
 
-pub mod framer;
 pub mod oversampler;
 
+#[allow(unused_imports)] // FrameTiming re-exported for downstream consumers
+pub use vintage_kvm_ps2_framer::{Framer, FrameTiming, Ps2Frame};
 pub use vintage_kvm_signatures::MachineClass;
 #[allow(unused_imports)] // exposed for Phase 1 classifier
 pub use vintage_kvm_signatures::KeyboardFeatures;
-
-/// One PS/2 frame extracted from the wire. Carries timing metadata from the
-/// oversampler (when populated; demodulator-only path leaves `timing` zeroed).
-#[derive(Debug, Clone, Copy, defmt::Format)]
-pub struct Ps2Frame {
-    pub data: u8,
-    pub parity_ok: bool,
-    pub framing_ok: bool,
-    pub start_timestamp_us: u64,
-    pub timing: FrameTiming,
-}
-
-#[derive(Debug, Clone, Copy, Default, defmt::Format)]
-pub struct FrameTiming {
-    /// Measured period between CLK falling edges for each bit slot.
-    pub bit_periods_us: [u16; 11],
-    /// Signed CLK→DATA edge skew at the start bit (positive = DATA settles
-    /// after CLK).
-    pub clk_data_skew_us: i8,
-    /// CLK transitions shorter than the 4 µs glitch threshold.
-    pub glitch_count: u8,
-}
 
 #[derive(Debug, Clone, Copy, defmt::Format)]
 pub enum Ps2Error {

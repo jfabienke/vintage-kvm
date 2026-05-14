@@ -1493,6 +1493,7 @@ dependencies = [
  "pio",
  "smart-leds",
  "vintage-kvm-protocol",
+ "vintage-kvm-ps2-framer",
  "vintage-kvm-signatures",
  "vintage-kvm-telemetry-schema",
 ]
@@ -1503,6 +1504,13 @@ version = "0.1.0"
 dependencies = [
  "defmt",
  "heapless 0.8.0",
+]
+
+[[package]]
+name = "vintage-kvm-ps2-framer"
+version = "0.1.0"
+dependencies = [
+ "defmt",
 ]
 
 [[package]]

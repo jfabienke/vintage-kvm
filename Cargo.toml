@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/protocol",
+    "crates/ps2-framer",
     "crates/signatures",
     "crates/telemetry-schema",
     "firmware",

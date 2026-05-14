@@ -23,7 +23,7 @@ use embassy_rp::pio::{
 };
 use fixed::types::U24F8;
 
-use super::framer::Framer;
+use super::Framer;
 
 bind_interrupts!(struct Irqs {
     PIO1_IRQ_0 => InterruptHandler<PIO1>;

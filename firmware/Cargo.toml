@@ -30,6 +30,7 @@ embassy-futures = "0.1.2"
 heapless = { workspace = true }
 
 vintage-kvm-protocol = { path = "../crates/protocol", features = ["defmt"] }
+vintage-kvm-ps2-framer = { path = "../crates/ps2-framer", features = ["defmt"] }
 vintage-kvm-telemetry-schema = { path = "../crates/telemetry-schema", features = ["defmt", "serde"] }
 vintage-kvm-signatures = { path = "../crates/signatures", features = ["defmt"] }
 

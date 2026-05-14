@@ -1,0 +1,14 @@
+[package]
+name = "vintage-kvm-ps2-framer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PS/2 wire frame extractor (XT 9-bit + AT/PS2 11-bit) — no_std, host-testable"
+
+[features]
+default = []
+# Enable `defmt::Format` derives on public types (for embedded logging).
+defmt = ["dep:defmt"]
+
+[dependencies]
+defmt = { workspace = true, optional = true }
