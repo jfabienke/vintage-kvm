@@ -58,6 +58,7 @@
 
 use defmt::trace;
 
+use super::hardware::LptHardware;
 use super::pio_compat_in::PioCompatIn;
 use super::pio_nibble_out::PioNibbleOut;
 use super::{LptError, LptMode, LptPhy};
@@ -68,11 +69,37 @@ pub struct SppNibblePhy {
 }
 
 impl SppNibblePhy {
-    pub fn new(compat_in: PioCompatIn, nibble_out: PioNibbleOut) -> Self {
+    /// Build the SPP-forward / nibble-reverse pair from the
+    /// hardware's parked SM0, SM1, and DMA channel.
+    pub fn build(hw: &mut LptHardware) -> Self {
+        let sm0 = hw
+            .parked_sm0
+            .take()
+            .expect("LptHardware::parked_sm0 must be available when constructing a phy");
+        let sm1 = hw
+            .parked_sm1
+            .take()
+            .expect("LptHardware::parked_sm1 must be available when constructing a phy");
+        let dma = hw
+            .parked_dma_ch4
+            .take()
+            .expect("LptHardware::parked_dma_ch4 must be available when constructing a phy");
+        let compat_in = PioCompatIn::new(&mut hw.common, sm0, &hw.pins);
+        let nibble_out = PioNibbleOut::new(&mut hw.common, sm1, dma, &hw.pins);
         Self {
             compat_in,
             nibble_out,
         }
+    }
+
+    /// Tear down: drain TX, disable both SMs, free both program
+    /// slots, and return SM0/SM1/DMA to the hardware's parking lot.
+    pub async fn dismantle(self, hw: &mut LptHardware) {
+        let (sm1, dma) = self.nibble_out.dismantle(&mut hw.common).await;
+        let sm0 = self.compat_in.dismantle(&mut hw.common);
+        hw.parked_sm0 = Some(sm0);
+        hw.parked_sm1 = Some(sm1);
+        hw.parked_dma_ch4 = Some(dma);
     }
 
     /// Wait for the next host-strobe falling edge, then return the byte

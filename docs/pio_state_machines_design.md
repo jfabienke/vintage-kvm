@@ -724,6 +724,74 @@ Option B is cleaner for full ECP fidelity. Costs 1 more bit per FIFO entry and 1
 
 **Throughput:** ECP wire can hit ~2 MB/s. At 30 MHz PIO clock with 5-instruction inner loop = 167 ns/cycle = 6 MB/s peak. DMA from PSRAM via XIP cache delivers ~10 MB/s, so PSRAM is not the bottleneck.
 
+### 10.6 PIO program lifecycle across IEEE 1284 modes
+
+The four 1284 modes use different programs on the forward and reverse SMs. PIO0 has 32 instructions of program memory shared across all of its SMs. Pre-loading every program at boot would overflow that budget:
+
+```
+Program memory cost per program (current + projected)
+─────────────────────────────────────────────────────────────────
+                              instr   role
+  lpt_compat_in    (built)        3   forward strobe-edge sampler
+                                      (reused by SPP, Byte, ECP-fwd)
+  lpt_nibble_out   (built)        5   reverse 5-bit nibble pair
+  lpt_byte_out     (planned)    ~6    reverse 8-bit + handshake
+  lpt_epp_read     (planned)    ~5    host write cycle  (nWrite=0)
+  lpt_epp_write    (planned)    ~7    host read  cycle  (nWrite=1)
+  lpt_ecp_fwd      (planned)    ~6    host→Pico burst, HostAck
+  lpt_ecp_rev      (planned)    ~6    Pico→host burst, PeriphAck
+                              ─────
+  Sum of all programs           ~38   exceeds 32 — can't pre-load
+```
+
+That sum is misleading though. The 1284 negotiator picks one mode per session and stays there; only the **pair** of programs for that mode needs to be loaded simultaneously:
+
+```
+Per-mode coexistence (what actually has to fit at once)
+─────────────────────────────────────────────────────────────────
+Mode             SM0 program        SM1 program         Total  Free
+─────────────────────────────────────────────────────────────────
+SPP              lpt_compat_in (3)  —                       3    29
+Nibble (boot)    lpt_compat_in (3)  lpt_nibble_out (5)      8    24
+Byte             lpt_compat_in (3)  lpt_byte_out (6)        9    23
+EPP              lpt_epp_read (5)   lpt_epp_write (7)      12    20
+ECP              lpt_ecp_fwd (6)    lpt_ecp_rev (6)        12    20
+─────────────────────────────────────────────────────────────────
+Worst single mode footprint                                12 / 32
+```
+
+So PIO0's instruction memory is over-provisioned by roughly 2.5× for the busiest single mode. Even doubling every estimate, the worst case still fits.
+
+SM and DMA budgets stay roomy too:
+
+```
+PIO0 utilization, worst single 1284 mode
+─────────────────────────────────────────────────────────────────
+  SMs           2 / 4    (SM0 forward, SM1 reverse; SM2/SM3 spare)
+  Instr mem     12 / 32  (reload on mode transition, not pre-load)
+  IRQ flags     0 / 4
+  DMA chans     2 of 12  (the firmware overall uses 6 of 12)
+  RX/TX FIFOs   4 words each, joinable to 8 if any mode wants it
+```
+
+**Transition strategy: reload, not pre-load.** Mode changes happen at the 1284 negotiation boundary — by spec this is a quiescent handshake with no bulk data in flight. The transition path is therefore allowed to take microseconds:
+
+1. Drain both SMs' FIFOs (CPU-pull until empty, with timeout).
+2. `set_enable(false)` on both SMs; stop both DMA channels.
+3. Drop the old `LoadedProgram` handles (frees their instruction-memory slots in embassy's allocator).
+4. `common.load_program(...)` for the new pair of programs.
+5. Build a fresh `Config` for each SM (program offset, clock divider, pin maps, side-set).
+6. Restart DMA + `set_enable(true)`.
+
+Pre-loading all programs and only `set_config`-swapping between them would be cheaper at transition time, but doesn't fit the budget at 32 instructions. Reload is cheap enough at the cadence we actually use it — typically once or twice per session, never per-packet.
+
+**Where this gets tight.** Two scenarios would force a redesign:
+
+- **A mode wanting more than 2 SMs.** We have SM2/SM3 spare, so a mode with three concurrent SMs (e.g., separate read/write/arbiter) still fits. Beyond that we'd have to choose between modes or move state to another PIO block.
+- **A single program over ~24 instructions.** ECP with PIO-side RLE decode would be borderline. The plan keeps PIO programs as raw byte movers — RLE/compression handling stays CPU-side — which keeps per-program cost well under 10 instructions.
+
+Neither shows up in the 1284 spec as currently planned, so the budget holds.
+
 ---
 
 ## 11. DMA architecture

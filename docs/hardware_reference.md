@@ -73,7 +73,9 @@
 | PError / nAckReverse | 1 pin   | Input |
 | Select / Xflag    | 1 pin      | Input |
 | nFault / nPeriphRequest | 1 pin | Input |
-| **Total**         | **~14–16 pins** | Leaves plenty of headroom |
+| **DIR** (chip mode control)  | 1 pin | Output — flips D0..D7 direction; see §11.3 |
+| **HD** (chip mode control)   | 1 pin | Output — open-drain vs totem-pole driver style; see §11.3 |
+| **Total**         | **~16–18 pins** | Leaves plenty of headroom |
 
 ---
 
@@ -144,8 +146,8 @@
 
 | GPIO    | Function                  | Direction     | Connected To           | Notes |
 |---------|---------------------------|---------------|------------------------|-------|
-| GP0     | UART0_TX (Debug)          | Output        | USB-Serial adapter     | Development only; Feather "TX" label |
-| GP1     | UART0_RX (Debug)          | Input         | USB-Serial adapter     | Feather "RX" label |
+| GP0     | **HD** (1284 chip mode)   | Output        | 74LVC161284 pin 1      | High-drive ctrl — open-drain (LOW) vs totem-pole (HIGH). See §11.3. Repurposed from Feather "TX" / UART0_TX. |
+| GP1     | UART0_RX (Debug)          | Input         | USB-Serial adapter     | Feather "RX" label; debug UART RX. defmt-RTT is the production logging path so the UART is not required at runtime. |
 | GP2     | PS2_KBD_CLK_IN            | Input         | 74LVC07A Pin 2         | Read actual line state |
 | GP3     | PS2_KBD_CLK_PULL          | Output        | 74LVC07A Pin 1         | Active-low pull-down |
 | GP4     | PS2_KBD_DATA_IN           | Input         | 74LVC07A Pin 4         | — |
@@ -166,9 +168,9 @@
 | GP26    | Select / Xflag            | Input         | 74LVC161284            | Feather "A0" (ADC capable, used digital) |
 | GP27    | nFault / nPeriphRequest   | Input         | 74LVC161284            | Feather "A1" |
 | GP28    | PS2_AUX_CLK_PULL          | Output        | 74LVC07A Pin 5         | Feather "A2"; AUX block split from GP6 here |
-| GP29    | Spare                     | —             | —                      | Future ADC / diagnostic |
+| GP29    | **DIR** (1284 chip mode)  | Output        | 74LVC161284 pin 48     | Data-bus direction — `L` = host writes, `H` = peripheral writes. See §11.3. |
 
-**Total GPIOs allocated:** 26 functional + 2 status LEDs (GP7 red, GP21 NeoPixel) + 1 reserved (GP8 PSRAM CS) + 1 spare (GP29). 29 of the Feather's 29 user-accessible GPIOs covered.
+**Total GPIOs allocated:** 27 functional + 2 status LEDs (GP7 red, GP21 NeoPixel) + 1 reserved (GP8 PSRAM CS). 29 of the Feather's 29 user-accessible GPIOs covered.
 
 **On bare Pico 2:** the same logical functions can be mapped to GP0–GP25 if no PSRAM is present and the on-board LED on GP25 is sacrificed. The Feather pinout above is the reference; deviations should be documented per-build.
 
@@ -202,6 +204,52 @@ Per PS/2 line:
 **Recommendation for v1.0:**
 - Use **TSSOP14** for the 74LVC07A on the first prototype.
 - Use **TSSOP-48** for the 74LVC161284.
+
+### 11.3 74LVC161284 Mode-Control Inputs (DIR, HD)
+
+The SN74LV161284 / SN74LVC161284 selects all four IEEE 1284 transfer modes via exactly **two** mode-control input pins. The rest of the chip's behavior — direction of the four forward control lines and five reverse status lines, the integrated pull-ups, the 33 Ω cable-side termination — is implicit from these two pins. Source: TI app note [SCEA013 "Logic Solutions for IEEE Std 1284"](https://www.ti.com/lit/pdf/scea013).
+
+| 74LVC161284 pin | Name | Function | Pico GPIO |
+|---|---|---|---|
+| 1  | **HD**  | Selects driver style on cable-side outputs. `LOW` = open-drain (IEEE 1284-I "Level 1", legacy-compatible, uses the chip's integrated 1.4 kΩ pull-ups). `HIGH` = totem-pole (IEEE 1284-II "Level 2", uses 33 Ω cable termination, required for Byte/EPP/ECP). | **GP0** |
+| 48 | **DIR** | Selects bidirectional data-bus direction. `LOW` = host→peripheral (host writes data, peripheral reads). `HIGH` = peripheral→host (peripheral writes data, host reads). | **GP29** |
+
+**Function table (from SCEA013 Table 2):**
+
+| DIR | HD | Output | Active routing |
+|---|---|---|---|
+| L | L | Open drain | A9–A13 → Y9–Y13, PERI LOGIC IN → OUT (5 reverse status pins only; data bus idle) |
+| L | H | Totem pole | **B1–B8 → A1–A8** (host writes data) + 5 reverse status + 4 forward control |
+| H | L | Open drain | **A1–A8 → B1–B8** (peripheral writes data) + 5 reverse status + 4 forward control |
+| H | H | Totem pole | **A1–A8 → B1–B8** (peripheral writes data) + 5 reverse status + 4 forward control |
+
+The 5 reverse status (A9–A13 → Y9–Y13), 4 forward control (C14–C17 → A14–A17), and 2 logic-high handshake (PERI LOGIC, HOST LOGIC) signals are *unidirectional and hardwired* — they don't need a mode pin.
+
+**IEEE 1284 mode → (DIR, HD) mapping:**
+
+| Mode             | DIR | HD | Notes |
+|------------------|-----|----|-------|
+| Compat (SPP)     | L   | L  | Centronics-legacy; open-drain. |
+| Nibble reverse   | L   | L  | Data bus unused; nibble carried on the always-on status path. |
+| Byte reverse     | H   | H  | Peripheral drives D0..D7; totem-pole for clean edges. |
+| EPP read         | L   | H  | Host writes; per-cycle DIR flip required if interleaved with EPP write. |
+| EPP write        | H   | H  | Peripheral writes; per-cycle DIR flip required. |
+| ECP forward      | L   | H  | Host writes a burst; DIR stable for the whole burst. |
+| ECP reverse      | H   | H  | Peripheral writes a burst; DIR stable for the whole burst. |
+
+**EPP/ECP direction-flip note.** EPP can flip data direction per bus cycle (~500 ns). CPU-driven DIR via `LptMux::switch_to` cannot meet that timing. Two production options:
+
+1. **PIO output mirroring `nWrite`.** Allocate one PIO output (we have spare instructions on PIO0) running a tiny "DIR follower" SM that drives DIR from the host's `nWrite` line. Zero CPU involvement; matches the uss720 reference design approach.
+2. **External glue logic.** A discrete inverter wired from `nWrite` → DIR on the PCB. Even simpler than (1) but adds a part.
+
+For Compat / Nibble / Byte / ECP-burst, CPU-driven DIR is fine — direction is stable for the whole transfer.
+
+**Other useful chip features (from SCEA013):**
+
+- Both supplies independent: `VCC` = 3.0–3.6 V (Pico's 3.3 V) and `VCC_CABLE` = 3.0–5.5 V (covers the host's 5 V LPT). One PMOS transistor between `VCC` and the cable-side outputs explicitly prevents back-drive when the peripheral is off and the host is live.
+- Integrated 33 Ω series termination on every cable-side output (active when HD=H) — no discrete resistors needed.
+- Integrated 1.4 kΩ pull-ups on open-drain outputs (active when HD=L).
+- Pinout: 48-pin DGG/DL package (TSSOP). HD at pin 1, DIR at pin 48 (opposite corners). VCC at pins 7 and 18; VCC_CABLE at pins 31 and 42.
 
 ---
 

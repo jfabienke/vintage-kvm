@@ -45,9 +45,8 @@ mod util;
 
 use crc_sniffer::DmaSniffer;
 use lifecycle::SupervisorState;
-use lpt::compat::SppNibblePhy;
-use lpt::pio_compat_in::PioCompatIn;
-use lpt::pio_nibble_out::PioNibbleOut;
+use lpt::hardware::LptHardware;
+use lpt::mux::LptMux;
 use protocol::stage_blobs::{EmbeddedStage2, STAGE2_PLACEHOLDER};
 use ps2::tx::{AuxTx, KbdTx};
 use protocol::{handle_packet, DispatchOutcome, SessionState};
@@ -194,47 +193,58 @@ async fn main(spawner: Spawner) {
     spawner.spawn(ps2::injector::run(injector).expect("spawn ps2 injector"));
     spawner.spawn(ps2::mouse_input::run(mouse_injector).expect("spawn ps2 mouse injector"));
 
-    // PIO0 hosts both LPT SPP-nibble state machines:
-    //   SM0 = lpt_compat_in   (forward: host → Pico, 9-bit capture)
-    //   SM1 = lpt_nibble_out  (reverse: Pico → host, 2 × 5-bit nibble)
+    // PIO0 hosts the LPT state machines. SM0 and SM1 are owned by
+    // whichever phy `LptMux` currently has active (SPP-nibble at
+    // boot); the mux can drain + dismantle + rebuild a different
+    // mode's program pair on a 1284 negotiation event. See
+    // `docs/pio_state_machines_design.md` §10.6 for the lifecycle
+    // and `lpt/mux.rs` for the dispatcher.
+    //
     // Pin allocation per `docs/hardware_reference.md` §3.3 and
-    // `docs/pio_state_machines_design.md` §10. Host strobe is currently
-    // assumed to land on GP11 (nInit routing TBD; see pio_state_machines
-    // _design.md §4.4).
+    // `docs/pio_state_machines_design.md` §10. Host strobe is
+    // currently assumed to land on GP11 (nInit routing TBD; see
+    // pio_state_machines_design.md §4.4).
     let Pio {
-        mut common,
+        common,
         sm0,
         sm1,
         ..
     } = Pio::new(p.PIO0, lpt::Pio0Irqs);
 
-    let compat_in = PioCompatIn::new(
-        &mut common,
+    let lpt_hw = LptHardware::new(
+        common,
         sm0,
-        p.DMA_CH3,
-        p.PIN_11,
-        p.PIN_12,
-        p.PIN_13,
-        p.PIN_14,
-        p.PIN_15,
-        p.PIN_16,
-        p.PIN_17,
-        p.PIN_18,
-        p.PIN_19,
-    );
-
-    let nibble_out = PioNibbleOut::new(
-        &mut common,
         sm1,
+        p.DMA_CH3,
         p.DMA_CH4,
-        p.PIN_23, // nAck    (nibble bit 3)
-        p.PIN_24, // Busy    (phase)
-        p.PIN_25, // PError  (nibble bit 2)
-        p.PIN_26, // Select  (nibble bit 1)
-        p.PIN_27, // nFault  (nibble bit 0)
+        p.PIN_11, // nStrobe / HostClk
+        p.PIN_12, // D0
+        p.PIN_13, // D1
+        p.PIN_14, // D2
+        p.PIN_15, // D3
+        p.PIN_16, // D4
+        p.PIN_17, // D5
+        p.PIN_18, // D6
+        p.PIN_19, // D7
+        p.PIN_20, // nAutoFd / HostAck / nDataStb
+        p.PIN_22, // nSelectIn / 1284Active
+        p.PIN_23, // nAck / PeriphClk
+        p.PIN_24, // Busy / PeriphAck / nWait
+        p.PIN_25, // PError
+        p.PIN_26, // Select
+        p.PIN_27, // nFault
     );
 
-    let phy = SppNibblePhy::new(compat_in, nibble_out);
+    let mut phy = LptMux::new(lpt_hw);
+    // Boot-time smoke test of the mode-swap path: a self-reload
+    // (SppNibble → SppNibble) exercises drain + dismantle + free +
+    // load + reconfigure. Any future regression in the lifecycle
+    // (e.g. an instr-memory leak that breaks subsequent loads) fails
+    // here at startup rather than mid-session when 1284 negotiation
+    // first tries it.
+    if phy.switch_to(lpt::LptMode::SppNibble).await.is_err() {
+        defmt::panic!("lpt mux: boot-time self-reload failed");
+    }
 
     let transport = LptTransport::new(phy, TELEMETRY);
 

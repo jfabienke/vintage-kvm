@@ -50,16 +50,16 @@
 //! `recv_byte` blocks waiting for the host's response, which can't
 //! arrive until our last byte reaches it.
 
-use embassy_rp::Peri;
 use embassy_rp::dma;
 use embassy_rp::gpio::Level;
-use embassy_rp::peripherals::{DMA_CH4, PIN_23, PIN_24, PIN_25, PIN_26, PIN_27, PIO0};
+use embassy_rp::peripherals::PIO0;
 use embassy_rp::pio::{
     Common, Config, Direction, FifoJoin, LoadedProgram, ShiftConfig, ShiftDirection, StateMachine,
 };
+use embassy_time::Timer;
 use fixed::types::U24F8;
 
-use crate::irqs::DmaIrqs;
+use super::hardware::LptPins;
 use super::{LptError, LptMode, LptPhy};
 
 /// PIO clock target: 100 kHz → 10 µs/cycle, lets `nop [9]` cover the
@@ -102,26 +102,23 @@ impl<'d> NibbleOutProgram<'d> {
 pub struct PioNibbleOut {
     sm1: StateMachine<'static, PIO0, 1>,
     dma: dma::Channel<'static>,
+    program: LoadedProgram<'static, PIO0>,
 }
 
 impl PioNibbleOut {
     pub fn new(
         common: &mut Common<'static, PIO0>,
         mut sm1: StateMachine<'static, PIO0, 1>,
-        dma_ch: Peri<'static, DMA_CH4>,
-        nack: Peri<'static, PIN_23>,
-        busy: Peri<'static, PIN_24>,
-        perror: Peri<'static, PIN_25>,
-        select: Peri<'static, PIN_26>,
-        nfault: Peri<'static, PIN_27>,
+        dma: dma::Channel<'static>,
+        lpt_pins: &LptPins,
     ) -> Self {
-        let nack = common.make_pio_pin(nack);
-        let busy = common.make_pio_pin(busy);
-        let perror = common.make_pio_pin(perror);
-        let select = common.make_pio_pin(select);
-        let nfault = common.make_pio_pin(nfault);
-
-        let pins = [&nack, &busy, &perror, &select, &nfault];
+        let pins = [
+            &lpt_pins.nack,
+            &lpt_pins.busy,
+            &lpt_pins.perror,
+            &lpt_pins.select,
+            &lpt_pins.nfault,
+        ];
 
         // Drive a known idle (LOW everywhere) before enabling the SM, so
         // DOS's first phase-edge detect sees a clean transition out of
@@ -157,8 +154,32 @@ impl PioNibbleOut {
             PIO_CLK_HZ / 1000
         );
 
-        let dma = dma::Channel::new(dma_ch, DmaIrqs);
-        Self { sm1, dma }
+        Self {
+            sm1,
+            dma,
+            program: program.prg,
+        }
+    }
+
+    /// Tear down: wait for the TX FIFO + wire to drain, disable SM,
+    /// free the program's instruction-memory slot. Returns the SM and
+    /// the DMA channel for re-parking in `LptHardware`.
+    pub async fn dismantle(
+        mut self,
+        common: &mut Common<'static, PIO0>,
+    ) -> (StateMachine<'static, PIO0, 1>, dma::Channel<'static>) {
+        // FIFO depth 8 × 210 µs per byte ≈ 1.7 ms worst-case to drain
+        // a full FIFO to wire. 5 ms is comfortable headroom and still
+        // imperceptible at the 1284 negotiation cadence we use it at.
+        Timer::after_millis(5).await;
+        self.sm1.set_enable(false);
+        // Safety: SM1 has been disabled, so the freed instruction-memory
+        // slot can't still be referenced by an in-flight PC fetch.
+        unsafe {
+            common.free_instr(self.program.used_memory);
+        }
+        defmt::info!("lpt nibble-out dismantled");
+        (self.sm1, self.dma)
     }
 
     /// Pack one nibble + phase bit into the 5-bit pin field driven by

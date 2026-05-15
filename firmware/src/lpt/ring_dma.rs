@@ -10,10 +10,8 @@
 
 use core::sync::atomic::AtomicU32;
 
-use embassy_rp::Peri;
 use embassy_rp::pac;
 use embassy_rp::pac::dma::vals::{DataSize, TransCountMode, TreqSel};
-use embassy_rp::peripherals::DMA_CH3;
 
 pub const RING_WORDS: usize = 256;
 const RING_BYTES: usize = RING_WORDS * 4; // 1024 = 2^10
@@ -33,7 +31,11 @@ static RING: RingStorage = RingStorage {
 };
 
 /// Arm DMA_CH3 to stream PIO0 SM0's RX FIFO into the LPT ring.
-pub fn arm(_dma_ch: Peri<'static, DMA_CH3>) -> RingHandle {
+///
+/// The Peri<DMA_CH3> ownership token lives on `LptHardware` so that
+/// mode swaps can arm/disarm without re-consuming a peripheral that
+/// embassy can't hand back. The channel ID and treq are fixed.
+pub fn arm() -> RingHandle {
     let ch = pac::DMA.ch(DMA_CH_LPT_IN);
 
     let read_addr = pac::PIO0.rxf(0).as_ptr() as u32;
@@ -74,6 +76,15 @@ pub fn arm(_dma_ch: Peri<'static, DMA_CH3>) -> RingHandle {
         base_addr: write_addr,
         last_tail: 0,
     }
+}
+
+/// Stop the LPT-in ring DMA. After return, the PIO RX FIFO will fill
+/// and the SM will stall — caller is expected to disable the SM next.
+pub fn disarm() {
+    let ch = pac::DMA.ch(DMA_CH_LPT_IN);
+    ch.ctrl_trig().modify(|w| {
+        w.set_en(false);
+    });
 }
 
 pub struct RingHandle {

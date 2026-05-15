@@ -5,8 +5,17 @@
 //! which implement the same `LptPhy` trait so the rest of the firmware
 //! treats them uniformly. See `docs/firmware_crate_and_trait_design.md` §3.1.
 
+pub mod byte;
 pub mod compat;
+pub mod ecp;
+pub mod epp;
+pub mod hardware;
+pub mod mux;
+pub mod negotiator;
+pub mod pio_byte_rev;
 pub mod pio_compat_in;
+pub mod pio_ecp;
+pub mod pio_epp;
 pub mod pio_nibble_out;
 pub mod ring_dma;
 

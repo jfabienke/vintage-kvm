@@ -25,16 +25,14 @@
 //! Phase 5 EPP/ECP modes (250 kHz), the same ring still has ~1 ms of
 //! slack — well above the poll interval.
 
-use embassy_rp::Peri;
-use embassy_rp::peripherals::{
-    DMA_CH3, PIN_11, PIN_12, PIN_13, PIN_14, PIN_15, PIN_16, PIN_17, PIN_18, PIN_19, PIO0,
-};
+use embassy_rp::peripherals::PIO0;
 use embassy_rp::pio::{
     Common, Config, FifoJoin, LoadedProgram, ShiftConfig, ShiftDirection, StateMachine,
 };
 use embassy_time::Timer;
 use fixed::types::U24F8;
 
+use super::hardware::LptPins;
 use super::ring_dma::{self, RingHandle};
 use super::{LptError, LptMode, LptPhy};
 
@@ -70,11 +68,13 @@ impl<'d> CompatInProgram<'d> {
     }
 }
 
-/// Owns the loaded PIO state machine + the nine consumed pin handles
-/// + the DMA-ring drain.
+/// Owns the running PIO state machine + the loaded program slot +
+/// the DMA-ring drain. On dismantle, the SM and the program's
+/// instruction-memory slot are returned to the caller; the SM keeps
+/// running until disabled.
 pub struct PioCompatIn {
-    #[allow(dead_code)] // held to keep the SM alive even though DMA drains it
     sm0: StateMachine<'static, PIO0, 0>,
+    program: LoadedProgram<'static, PIO0>,
     ring: RingHandle,
 }
 
@@ -84,41 +84,31 @@ pub struct PioCompatIn {
 const POLL_INTERVAL_US: u64 = 200;
 
 impl PioCompatIn {
-    /// Claim PIO0 SM0 + the nine input pins (host strobe at IN_BASE,
-    /// then D0..D7) + DMA_CH3 and arm the program. Pins are configured
-    /// as PIO inputs; callers must not have already wrapped them in
-    /// `gpio::Input` or driven them as outputs.
+    /// Load the compat-in program into `common`, configure SM0 with
+    /// the strobe + D0..D7 pin window, enable it, and arm the
+    /// compat-in ring DMA.
     pub fn new(
         common: &mut Common<'static, PIO0>,
         mut sm0: StateMachine<'static, PIO0, 0>,
-        dma_ch: Peri<'static, DMA_CH3>,
-        strobe: Peri<'static, PIN_11>,
-        d0: Peri<'static, PIN_12>,
-        d1: Peri<'static, PIN_13>,
-        d2: Peri<'static, PIN_14>,
-        d3: Peri<'static, PIN_15>,
-        d4: Peri<'static, PIN_16>,
-        d5: Peri<'static, PIN_17>,
-        d6: Peri<'static, PIN_18>,
-        d7: Peri<'static, PIN_19>,
+        pins: &LptPins,
     ) -> Self {
-        let strobe = common.make_pio_pin(strobe);
-        let d0 = common.make_pio_pin(d0);
-        let d1 = common.make_pio_pin(d1);
-        let d2 = common.make_pio_pin(d2);
-        let d3 = common.make_pio_pin(d3);
-        let d4 = common.make_pio_pin(d4);
-        let d5 = common.make_pio_pin(d5);
-        let d6 = common.make_pio_pin(d6);
-        let d7 = common.make_pio_pin(d7);
-
         let program = CompatInProgram::new(common);
 
         let mut cfg = Config::default();
         cfg.use_program(&program.prg, &[]);
         // IN_BASE = strobe; subsequent 8 are D0..D7. PIO requires
         // consecutive pin range; the assertion lives in set_in_pins.
-        cfg.set_in_pins(&[&strobe, &d0, &d1, &d2, &d3, &d4, &d5, &d6, &d7]);
+        cfg.set_in_pins(&[
+            &pins.strobe,
+            &pins.d0,
+            &pins.d1,
+            &pins.d2,
+            &pins.d3,
+            &pins.d4,
+            &pins.d5,
+            &pins.d6,
+            &pins.d7,
+        ]);
 
         // 150 MHz PIO clock — instruction-paced; the host strobe pulse is
         // wide enough (DOS Stage 0/1 holds it for tens of µs) that no
@@ -146,9 +136,30 @@ impl PioCompatIn {
 
         // Arm DMA AFTER the SM is enabled so the very first byte the
         // PIO captures lands in the ring rather than stalling the SM.
-        let ring = ring_dma::arm(dma_ch);
+        let ring = ring_dma::arm();
 
-        Self { sm0, ring }
+        Self {
+            sm0,
+            program: program.prg,
+            ring,
+        }
+    }
+
+    /// Tear down: stop DMA, disable SM, free the program's
+    /// instruction-memory slot. Returns ownership of SM0 to the
+    /// caller (typically `LptHardware`'s parking slot).
+    pub fn dismantle(mut self, common: &mut Common<'static, PIO0>) -> StateMachine<'static, PIO0, 0> {
+        ring_dma::disarm();
+        self.sm0.set_enable(false);
+        // Safety: SM0 has been disabled above, so no in-flight
+        // instruction can still reference the freed slot. The ring
+        // DMA was also stopped before disabling the SM, so the FIFO
+        // isn't being drained concurrently.
+        unsafe {
+            common.free_instr(self.program.used_memory);
+        }
+        defmt::info!("lpt compat-in dismantled");
+        self.sm0
     }
 
     /// Block until the next host-strobe falling edge, then return the
