@@ -49,11 +49,10 @@
 //!
 //! D0..D7 bidirectionality is selected by the 74LVC161284's DIR
 //! pin (`docs/hardware_reference.md` §11.3). EPP's per-cycle
-//! direction flip is faster than CPU-driven DIR can manage — the
-//! production path is a tiny "DIR follower" PIO SM that drives GP29
-//! (DIR) from the host's `nWrite` line. Until that follower SM
-//! lands, this phy works for whichever single direction DIR is
-//! statically held in.
+//! direction flip is handled by [`super::pio_dir_follower`] on
+//! PIO0 SM2 — a one-instruction `mov pins, pins` mirror that drives
+//! DIR from the host's `nWrite` line at PIO clock speed. The CPU
+//! never touches DIR while EPP is active.
 //!
 //! ## Address cycles
 //!

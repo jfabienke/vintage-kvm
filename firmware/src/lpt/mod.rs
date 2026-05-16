@@ -14,6 +14,7 @@ pub mod mux;
 pub mod negotiator;
 pub mod pio_byte_rev;
 pub mod pio_compat_in;
+pub mod pio_dir_follower;
 pub mod pio_ecp;
 pub mod pio_epp;
 pub mod pio_nibble_out;

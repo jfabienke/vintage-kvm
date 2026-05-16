@@ -7,14 +7,14 @@
 //!
 //! ## Hardware prerequisites
 //!
-//! EPP needs the 74LVC161284 set to `HD=H` (totem-pole outputs) and
-//! `DIR` flipping per bus cycle (`L` for host writes, `H` for host
-//! reads) — see `docs/hardware_reference.md` §11.3. Per-cycle DIR
-//! flipping from the CPU can't meet the ~500 ns EPP cycle time;
-//! the production path is a small PIO "DIR follower" SM that drives
-//! GP29 (DIR) from the host's `nWrite` line. Until that lands,
-//! building this phy is allowed (lifecycle is correct) but the wire
-//! data direction won't follow the host's intent at speed.
+//! `LptMux::switch_to(Epp)` drives the 74LVC161284's HD (GP0) HIGH
+//! and DIR (GP29) LOW (host-writes default) before invoking
+//! [`EppPhy::build`]. Per-cycle DIR flipping for EPP read/write
+//! interleaving is handled by [`super::pio_dir_follower`] on PIO0
+//! SM2 — a one-instruction `mov pins, pins` mirror that drives DIR
+//! from the host's `nWrite` line at ~20 ns latency. `EppPhy::build`
+//! brings up that follower; `EppPhy::dismantle` tears it down and
+//! hands DIR's FUNCSEL back to SIO.
 //!
 //! Address-cycle support (nAddrStb on nSelectIn / GP22) is not
 //! implemented here; only data cycles. Stage 1's EPP driver does
@@ -25,11 +25,17 @@ use embassy_rp::peripherals::PIO0;
 use embassy_rp::pio::StateMachine;
 
 use super::hardware::LptHardware;
+use super::pio_dir_follower::PioDirFollower;
 use super::pio_epp::PioEpp;
 use super::{LptError, LptMode, LptPhy};
 
 pub struct EppPhy {
     epp: PioEpp,
+    /// SM2 + 1-instruction mirror loop that drives DIR (GP29) from
+    /// the host's nWrite (GP11) at PIO clock speed. EPP-only — the
+    /// follower owns DIR's FUNCSEL while this phy is alive and
+    /// hands it back on dismantle.
+    dir_follower: Option<PioDirFollower>,
     // SM1 stays held on the phy while EPP runs (one-SM mode), so we
     // return it cleanly on dismantle. SM1 is not running any program.
     parked_sm1: Option<StateMachine<'static, PIO0, 1>>,
@@ -39,21 +45,35 @@ impl EppPhy {
     pub fn build(hw: &mut LptHardware) -> Self {
         let sm0 = hw.parked_sm0.take().expect("parked_sm0 must be available");
         let sm1 = hw.parked_sm1.take().expect("parked_sm1 must be available");
+        let sm2 = hw.parked_sm2.take().expect("parked_sm2 must be available");
         let dma = hw
             .parked_dma_ch4
             .take()
             .expect("parked_dma_ch4 must be available");
         let epp = PioEpp::new(&mut hw.common, sm0, dma, &hw.pins);
+        // Bring up the DIR follower *after* the EPP SM is enabled so
+        // the chip already sees a stable D-bus pattern when DIR
+        // starts mirroring nWrite. Order doesn't matter for
+        // correctness — both SMs run independently — but it keeps
+        // the bring-up sequence easy to reason about.
+        let dir_follower = PioDirFollower::new(&mut hw.common, sm2, &hw.pins);
         Self {
             epp,
+            dir_follower: Some(dir_follower),
             parked_sm1: Some(sm1),
         }
     }
 
     pub async fn dismantle(mut self, hw: &mut LptHardware) {
+        let sm2 = self
+            .dir_follower
+            .take()
+            .expect("dir_follower must be populated")
+            .dismantle(&mut hw.common);
         let (sm0, dma) = self.epp.dismantle(&mut hw.common).await;
         hw.parked_sm0 = Some(sm0);
         hw.parked_sm1 = self.parked_sm1.take();
+        hw.parked_sm2 = Some(sm2);
         hw.parked_dma_ch4 = Some(dma);
     }
 }

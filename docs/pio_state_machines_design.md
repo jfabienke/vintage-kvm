@@ -729,46 +729,51 @@ Option B is cleaner for full ECP fidelity. Costs 1 more bit per FIFO entry and 1
 The four 1284 modes use different programs on the forward and reverse SMs. PIO0 has 32 instructions of program memory shared across all of its SMs. Pre-loading every program at boot would overflow that budget:
 
 ```
-Program memory cost per program (current + projected)
+Program memory cost per program (built / planned)
 ─────────────────────────────────────────────────────────────────
                               instr   role
   lpt_compat_in    (built)        3   forward strobe-edge sampler
-                                      (reused by SPP, Byte, ECP-fwd)
+                                      (reused by SPP, Byte)
   lpt_nibble_out   (built)        5   reverse 5-bit nibble pair
-  lpt_byte_out     (planned)    ~6    reverse 8-bit + handshake
-  lpt_epp_read     (planned)    ~5    host write cycle  (nWrite=0)
-  lpt_epp_write    (planned)    ~7    host read  cycle  (nWrite=1)
-  lpt_ecp_fwd      (planned)    ~6    host→Pico burst, HostAck
-  lpt_ecp_rev      (planned)    ~6    Pico→host burst, PeriphAck
+  lpt_byte_rev     (built)        5   reverse 8-bit + nAck handshake
+  lpt_epp          (built)       12   combined fwd/rev on one SM
+                                      (dir bit prepended to TX word)
+  lpt_dir_follower (built)        1   EPP-only `mov pins, pins`
+                                      mirror of nWrite → DIR (SM2)
+  lpt_ecp_fwd      (built)        5   host→Pico burst, PeriphAck
+  lpt_ecp_rev      (built)        5   Pico→host burst, PeriphClk
                               ─────
-  Sum of all programs           ~38   exceeds 32 — can't pre-load
+  Sum of all programs            36   exceeds 32 — can't pre-load
 ```
 
 That sum is misleading though. The 1284 negotiator picks one mode per session and stays there; only the **pair** of programs for that mode needs to be loaded simultaneously:
 
 ```
 Per-mode coexistence (what actually has to fit at once)
-─────────────────────────────────────────────────────────────────
-Mode             SM0 program        SM1 program         Total  Free
-─────────────────────────────────────────────────────────────────
-SPP              lpt_compat_in (3)  —                       3    29
-Nibble (boot)    lpt_compat_in (3)  lpt_nibble_out (5)      8    24
-Byte             lpt_compat_in (3)  lpt_byte_out (6)        9    23
-EPP              lpt_epp_read (5)   lpt_epp_write (7)      12    20
-ECP              lpt_ecp_fwd (6)    lpt_ecp_rev (6)        12    20
-─────────────────────────────────────────────────────────────────
-Worst single mode footprint                                12 / 32
+─────────────────────────────────────────────────────────────────────
+Mode             SM0 program        SM1 program        SM2 program           Total  Free
+─────────────────────────────────────────────────────────────────────
+SPP              lpt_compat_in (3)  —                  —                       3    29
+Nibble (boot)    lpt_compat_in (3)  lpt_nibble_out (5) —                       8    24
+Byte             lpt_compat_in (3)  lpt_byte_rev (5)   —                       8    24
+EPP              lpt_epp (12)       —                  lpt_dir_follower (1)   13    19
+ECP              lpt_ecp_fwd (5)    lpt_ecp_rev (5)    —                      10    22
+─────────────────────────────────────────────────────────────────────
+Worst single mode footprint (EPP)                                            13 / 32
 ```
+
+EPP is the only mode that uses SM2: the [`lpt_dir_follower`](../firmware/src/lpt/pio_dir_follower.rs) one-instruction mirror loop drives the 74LVC161284's DIR pin (GP29) from the host's nWrite (GP11) so per-cycle direction flips happen in ~20 ns of input-sync latency instead of CPU-poll time. See `docs/hardware_reference.md` §11.3 for the chip-side reasoning.
 
 So PIO0's instruction memory is over-provisioned by roughly 2.5× for the busiest single mode. Even doubling every estimate, the worst case still fits.
 
 SM and DMA budgets stay roomy too:
 
 ```
-PIO0 utilization, worst single 1284 mode
+PIO0 utilization, worst single 1284 mode (EPP)
 ─────────────────────────────────────────────────────────────────
-  SMs           2 / 4    (SM0 forward, SM1 reverse; SM2/SM3 spare)
-  Instr mem     12 / 32  (reload on mode transition, not pre-load)
+  SMs           3 / 4    (SM0 combined fwd/rev, SM2 DIR follower;
+                          SM1 idle but held by EppPhy; SM3 spare)
+  Instr mem    13 / 32   (reload on mode transition, not pre-load)
   IRQ flags     0 / 4
   DMA chans     2 of 12  (the firmware overall uses 6 of 12)
   RX/TX FIFOs   4 words each, joinable to 8 if any mode wants it

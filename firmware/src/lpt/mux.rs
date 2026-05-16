@@ -78,6 +78,18 @@ impl LptMux {
             ActivePhy::Ecp(phy) => phy.dismantle(&mut self.hw).await,
         }
 
+        // Pre-build hook: drive the 74LVC161284's DIR/HD inputs to
+        // whatever `target` needs so the chip's data-bus direction
+        // and driver style are correct *before* the new phy's SMs
+        // start clocking. See `docs/hardware_reference.md` §11.3 for
+        // the per-mode (DIR, HD) values. Modes that have no phy fall
+        // back to Compat values — see the SppNibble revert below.
+        let phy_target = match target {
+            LptMode::Spp | LptMode::EcpDma => LptMode::SppNibble,
+            other => other,
+        };
+        self.hw.set_transceiver_mode(phy_target);
+
         match target {
             LptMode::SppNibble => {
                 let phy = SppNibblePhy::build(&mut self.hw);

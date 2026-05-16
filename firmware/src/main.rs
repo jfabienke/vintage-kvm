@@ -208,6 +208,7 @@ async fn main(spawner: Spawner) {
         common,
         sm0,
         sm1,
+        sm2,
         ..
     } = Pio::new(p.PIO0, lpt::Pio0Irqs);
 
@@ -215,8 +216,10 @@ async fn main(spawner: Spawner) {
         common,
         sm0,
         sm1,
+        sm2, // EPP DIR follower (parked until EPP enters)
         p.DMA_CH3,
         p.DMA_CH4,
+        p.PIN_0,  // 74LVC161284 HD  (chip pin 1)  — driver style
         p.PIN_11, // nStrobe / HostClk
         p.PIN_12, // D0
         p.PIN_13, // D1
@@ -233,6 +236,7 @@ async fn main(spawner: Spawner) {
         p.PIN_25, // PError
         p.PIN_26, // Select
         p.PIN_27, // nFault
+        p.PIN_29, // 74LVC161284 DIR (chip pin 48) — data-bus direction
     );
 
     let mut phy = LptMux::new(lpt_hw);

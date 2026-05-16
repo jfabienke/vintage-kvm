@@ -40,10 +40,13 @@
 //!
 //! - Stage 1's host-side 1284 negotiator (no caller emits the wire
 //!   pattern yet);
-//! - A pre-build hook in `LptMux::switch_to` that drives the
-//!   74LVC161284's DIR (GP29) and HD (GP0) inputs to the values
-//!   `docs/hardware_reference.md` §11.3 prescribes for the target
-//!   mode, *before* building the target phy.
+//! - The serve-loop `select!` that races `transport.recv_packet()`
+//!   against `negotiator.wait_for_start()` and routes the result
+//!   through `transport.switch_to(target)`.
+//!
+//! The 74LVC161284 mode-pin (DIR/HD) flip already happens inside
+//! `LptMux::switch_to` via the pre-build hook landed alongside this
+//! module — no negotiator-side hook needed for that.
 //!
 //! Hooking it up will look roughly like:
 //!

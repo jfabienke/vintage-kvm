@@ -7,13 +7,14 @@
 //!
 //! ## Hardware prerequisites
 //!
-//! Byte mode needs the 74LVC161284 set to `DIR=H, HD=H` (see
-//! `docs/hardware_reference.md` §11.3) so the chip flips its
-//! bidirectional data bus to peripheral-drives and uses totem-pole
-//! outputs on the cable side. `LptMux::switch_to(Byte)` does not yet
-//! drive those pins — when the production-side setter lands, it must
-//! flip GP0 (HD) and GP29 (DIR) before invoking [`BytePhy::build`]
-//! and restore them on dismantle.
+//! `LptMux::switch_to(Byte)` drives the 74LVC161284's HD (GP0) HIGH
+//! before invoking [`BytePhy::build`] so the cable-side outputs use
+//! totem-pole drivers (per `docs/hardware_reference.md` §11.3). DIR
+//! (GP29) starts LOW (forward); the byte_rev sub-phase flips it via
+//! `LptHardware::set_data_direction(true)` when the host hands the
+//! reverse channel to the peripheral. That phase-change wiring is
+//! still TODO — until it lands, `send_byte` works only when the
+//! board's mode-pin defaults already select reverse.
 
 use defmt::trace;
 

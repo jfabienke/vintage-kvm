@@ -9,13 +9,13 @@
 //!
 //! ## Hardware prerequisites
 //!
-//! ECP needs the 74LVC161284 set to `HD=H` (totem-pole), with
-//! `DIR` driven by the current burst direction: `L` for forward
-//! bursts (host writes), `H` for reverse bursts (peripheral writes).
-//! DIR is *stable for the whole burst* unlike EPP, so the CPU-driven
-//! setter in `LptMux::switch_to(Ecp)` is sufficient. See
-//! `docs/hardware_reference.md` §11.3 for the function table and
-//! pin assignments.
+//! `LptMux::switch_to(Ecp)` drives the 74LVC161284's HD (GP0) HIGH
+//! and DIR (GP29) LOW (forward burst default) before invoking
+//! [`EcpPhy::build`]. Reverse bursts flip DIR HIGH via
+//! `LptHardware::set_data_direction(true)` — DIR is stable for the
+//! whole burst, so the CPU-driven setter is fast enough (no PIO
+//! follower SM needed, unlike EPP). See `docs/hardware_reference.md`
+//! §11.3 for the function table and pin assignments.
 //!
 //! ## Command/data flag (HostAck)
 //!
