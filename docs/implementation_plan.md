@@ -54,13 +54,13 @@ vintage-kvm/
 
 | # | Path | Purpose | Status | Next step |
 |---|---|---|---|---|
-| 1 | `firmware/` | RP2350 Pico firmware | **Phase 3 MVP (~13 KB)** — bit-bang LPT SPP-nibble + CRC-16 packet protocol + CAP/PING/block-server dispatch. PIO designs ready: [`pio_state_machines_design.md`](pio_state_machines_design.md), instrumentation surface: [`instrumentation_surface.md`](instrumentation_surface.md). | Replace bit-bang with PIO programs; add PS/2 oversampler+demod for Phase 1 |
+| 1 | `firmware/` | RP2350 Pico firmware | **Phase 5a (~2.1 MB ELF, ~30 KB text)** — PIO-driven LPT SPP-nibble transport; all four 1284 PHYs built (Byte/EPP/ECP/SPP-nibble) with `LptMux` dismantle/build lifecycle; EPP DIR-follower SM; pre-build hook drives the 74LVC161284's HD/DIR pins per target mode; 1284 negotiator state machine ready. USB composite live: events + control + console (loopback) + vendor bulk. | Phase 5b: wire the mode-swap chain end-to-end — see "LPT mode-swap completion sequence" in §1 |
 | 2 | `dos/stage0/` | DOS Stage 0 bootstrap | **3 of 3 variants build** | Hardware-validate AT/PS2 private channels |
 | 3 | `dos/stage1/` | DOS Stage 1 loader | **v1.0 scaffold (4821 B)** — builds `PICO_BOOT` env block, shrinks via `AH=4Ah`, EXECs `PICO1284.EXE` via `AH=4Bh`; child errorlevel propagates | Per [`stage1_design.md`](stage1_design.md): auto-downgrade ladder once EPP/ECP byte pumps land |
 | 4 | `dos/pico1284/` | DOS Stage 2 TSR/CLI | **Stub** (49 B placeholder served by Stage 1). Future target: AISHELL ([`aishell_design.md`](aishell_design.md)) — REAL+DPMI two-runtime AI-native DOS shell | Install Open Watcom V2; set up wmake build alongside NASM; eventually realize as AISHELL |
 | 5 | `dos/common/` | Shared NASM/C headers | **Not created (YAGNI)** | Create on first cross-stage constant |
 | 6 | `host/` | Modern-host USB CDC client | **Not created, language undecided (Rust recommended)** | Decide language; scaffold workspace member |
-| 7 | `tools/` | Dev fixtures + tooling | **Not created** | First tool: `tools/tui/` — ratatui dashboard consuming the Pico's CDC telemetry stream ([`instrumentation_surface.md` §4](instrumentation_surface.md)); ships in Phase 6 |
+| 7 | `tools/` | Dev fixtures + tooling | **events-consumer + control-client shipped** — postcard+COBS reader for the events CDC; one-shot RPC CLI for the control CDC with `--json` mode for LLM/script callers. Both auto-detect the Pico by VID/PID. | Next tool: `tui/` — ratatui dashboard layering on events-consumer's decoder; ships in Phase 6 |
 | 8 | `hardware/` | KiCad schematic + PCB | **Not created** | Initial schematic-only project mirroring `hardware_reference.md` §3.3 |
 
 ### Dependency graph (what blocks what)
@@ -68,9 +68,9 @@ vintage-kvm/
 ```
                       ┌─────────────────────────────┐
                       │       firmware/             │
-                      │  Phase 3 MVP built; Phase   │
-                      │  1/2/4/5 designed, awaiting │
-                      │  Feather boards for bench   │
+                      │  Phase 5a built (all 1284   │
+                      │  PHYs + negotiator scaffolded);
+                      │  5b serve-loop wiring next  │
                       └──────┬──────────────────────┘
                              │ tests against
                              ▼
@@ -299,17 +299,19 @@ When host-targetable crates land (`host/`, `tools/`), expand `ci` and `test-all`
 |---|---|
 | `main.rs` task wiring | ✅ implemented |
 | `lifecycle.rs` Phase 3 state enum | ✅ scaffold |
-| `lpt/compat.rs` SPP-nibble bit-bang phy | ✅ implemented |
+| `lpt/compat.rs` SPP-nibble phy (PIO-driven) | ✅ implemented |
+| `lpt/{pio_compat_in,pio_nibble_out}.rs` SPP-nibble PIO programs | ✅ implemented (§10.1–10.2) |
+| `lpt/{byte,pio_byte_rev}.rs` Byte-mode PIO + phy | ✅ implemented (§10.3) |
+| `lpt/{epp,pio_epp}.rs` EPP PIO (combined fwd/rev) + phy | ✅ implemented (§10.4) |
+| `lpt/{ecp,pio_ecp}.rs` ECP PIO (fwd + rev) + phy | ✅ implemented (§10.5) |
+| `lpt/pio_dir_follower.rs` EPP DIR mirror (nWrite → DIR) | ✅ implemented (§10.6 + `hardware_reference.md` §11.3) |
+| `lpt/hardware.rs` + `lpt/mux.rs` mode-swap lifecycle | ✅ implemented (§10.6) |
+| `lpt/negotiator.rs` 1284 peripheral state machine | ✅ implemented; ⏳ serve-loop integration |
 | `packet/{mod,commands,crc16,crc32}.rs` | ✅ implemented |
 | `packet_stream.rs` byte→packet reassembler | ✅ implemented |
 | `protocol/{mod,cap,block_server,stage_blobs}.rs` | ✅ implemented |
 | Stage 2 placeholder blob (49 B DOS .COM) | ✅ embedded |
 | GP7 heartbeat LED task | ✅ implemented |
-| `lpt/compat_pio.rs` PIO-native SPP-nibble | 🟡 designed ([`pio_state_machines_design.md` §10.1-10.2](pio_state_machines_design.md)) |
-| `lpt/byte.rs` Byte-mode PIO | 🟡 designed (§10.3) |
-| `lpt/epp.rs` EPP PIO (fwd/rev combined) | 🟡 designed (§10.4) |
-| `lpt/ecp.rs` ECP DMA + sniffer | 🟡 designed (§10.5) |
-| `lpt/negotiation.rs` 1284 peripheral | 🟡 designed (§10) |
 | `ps2/oversampler.rs` PIO 1 MS/s + DMA ring | 🟡 designed (§6) |
 | `ps2/demodulator.rs` PIO edge-triggered byte stream | 🟡 designed (§9 two-pipeline architecture) |
 | `ps2/framer.rs` + `instrumentation.rs` | 🟡 designed (§7) |
@@ -325,7 +327,7 @@ When host-targetable crates land (`host/`, `tools/`), expand `ci` and `test-all`
 
 ### Plan (per phase)
 
-Driven by [`design.md` §22 Phases 0-11](design.md); each phase's firmware deliverable is enumerated in [`pico_firmware_design.md` §13](pico_firmware_design.md). The Phase 3 MVP currently built proves the protocol end-to-end with a bit-bang phy; Phase 4-5 swap in the designed PIO programs for line-rate throughput.
+Driven by [`design.md` §22 Phases 0-11](design.md); each phase's firmware deliverable is enumerated in [`pico_firmware_design.md` §13](pico_firmware_design.md). Phase 3 (bit-bang LPT MVP) has been replaced by Phase 4's PIO-driven SPP-nibble; Phase 5 split into **5a** (all 1284 PHYs built, dismantle/build lifecycle exercised at boot) and **5b** (serve-loop wiring + bench knob + host-side negotiator — see the sequence below).
 
 | Phase | New firmware modules | Phys live | Acceptance |
 |---|---|---|---|
@@ -333,15 +335,46 @@ Driven by [`design.md` §22 Phases 0-11](design.md); each phase's firmware deliv
 | **3 ✅** | `lpt/compat.rs`, `packet/*`, `packet_stream.rs`, `protocol/*`, `lifecycle.rs` | bit-bang LPT | Stage 1 downloads + EXECs placeholder Stage 2 |
 | 1 | `ps2/{oversampler,demodulator,framer,tx,classifier,instrumentation}`, `debug_inject/*` | PS/2 KBD (PIO) | XT/AT/PS/2 auto-detect on bench; DEBUG injects S0_*.COM |
 | 2 | `i8042/*`, `ps2/{oversampler,demodulator}` for AUX | PS/2 KBD+AUX | Stage 0 unlocks i8042 private mode; bidirectional bytes |
-| 4 | `lpt/{compat_pio,byte,negotiation}` | LPT PIO (compat+byte) | Stage 1's 1284 ladder lands on Byte mode |
-| 5 | `lpt/{epp,ecp}`, `crc_sniffer.rs` | LPT PIO (all modes) | Stage 1 stress-test passes at ECP rates; CRC sniffer accumulates Stage 2 CRC-32 |
+| 4 ✅ | `lpt/{hardware,mux,pio_compat_in,pio_nibble_out}`, `crc_sniffer.rs` | LPT PIO SPP-nibble | Phase-3 transport ported off bit-bang; DMA-sniffer CRC self-tests at boot |
+| 5a ✅ | `lpt/{byte,epp,ecp,pio_byte_rev,pio_epp,pio_ecp,pio_dir_follower,negotiator}` | all 1284 mode PHYs built | per-mode dismantle/build cycle compiles, boot self-reload passes |
+| **5b** | wire 5a into runtime — see "LPT mode-swap completion sequence" below | — | mode flips exercisable from `control-client` + via wire |
 | 6 | `transport/dual_plane.rs`, `usb_cdc/telemetry_channel.rs` finalized | both planes | File transfer over single + dual plane; TUI consumes CDC stream |
 | 7+ | screen capture, compression, VESA, full TSR | — | per `design.md` §22 |
+
+### LPT mode-swap completion sequence
+
+Phase 5b. All four 1284 PHYs and the negotiator state machine are built (Phase 5a) but nothing outside the boot self-test calls into them yet. The remaining work splits into three groups by dependency depth and feedback radius.
+
+**Group 1 — bench-ready unblockers (~50–100 lines each, single-sitting commits):**
+
+1. **`LptTransport::switch_to(target)` passthrough.** Forwards to the inner phy. Required by both (2) and (3); pointless to defer.
+2. **`lpt_mode` control verb + `control-client --json lpt_mode <name>`.** Wire knob from the host that fires through (1) into `LptMux::switch_to`. Lets us exercise the dismantle/build path + pre-build hook + DIR follower against a logic analyzer without needing Stage 1 or a DOS host.
+3. **`set_data_direction` callers inside `BytePhy` and `EcpPhy`.** Each phy currently runs only in whichever direction the chip woke up in. Adding a per-phy direction-flip helper (which calls into `LptHardware::set_data_direction`) closes the in-mode story for Byte and ECP forward↔reverse sub-phases.
+
+*After Group 1:* the transition machine is bench-testable end to end. Every PIO program runs at least once, every dismantle path is exercised, `control-client --json stats` reports the active mode. This is the right time to flash a board and walk the modes with a scope.
+
+**Group 2 — Pico-side production wiring (~100–200 lines each):**
+
+4. **Serve-loop `select!` between `recv_packet` and `negotiator.wait_for_start`.** Production trigger. Sits on top of (1) so `switch_to` is already callable. Until Stage 1 emits real negotiation patterns, validate with a synthetic stimulus (the Group-1 control verb poking the negotiator state, or a logic-analyzer-driven host fixture).
+5. **EPP address-cycle PIO support.** Extend `lpt_epp` with a branch (or add a second small program) for `nAddrStb` on GP22. Modest in code, but it's the only piece keeping EPP from being IEEE-1284-complete on our side. Land before Stage 1 starts using EPP so Stage 1 doesn't bake in a workaround.
+
+*After Group 2:* Pico side is feature-complete for production 1284. Every host-side code path has a matching firmware path. Beyond this, validating the production negotiator requires the host-side counterpart.
+
+**Group 3 — the DOS side (big):**
+
+6. **Stage 1's host-side 1284 negotiator.** Controller side of the same handshake we built in `lpt/negotiator.rs`, in 8086 assembly. Exchanges XRV bytes and walks the control-line sequence per IEEE 1284 §6.3. Linux's `parport/ieee1284.c` is the canonical reference (already cited in `docs/ieee1284_controller_reference.md`). Probably its own multi-commit thread; tracked in `dos/stage1/` (§3 of this plan).
+
+*After Group 3:* end-to-end mode changes work against a real DOS host; EPP / ECP throughput numbers become measurable.
+
+**Explicitly not in this sequence:**
+
+- Board respin with proper mode-pin routing — parallel hardware track, doesn't block firmware development (flying-lead bench setup works on the current dev board).
+- Phase 5b+ console real producer, vendor-bulk producers, TUI dashboard, full DOS PICO1284 client — separate workstreams kept out so the LPT mode-swap chain finishes cleanly.
 
 ### Open decisions
 
 - **`nInit` GPIO routing** (Phase 3 blocker): which Pico GPIO sees nInit through the 74LVC161284? Stage 0/1 pulse nInit as the host strobe in nibble mode. Phase 3 MVP assumes GP11; needs logic-analyzer confirmation on real hardware. Flagged in [`pico_phase3_design.md` §4.4](pico_phase3_design.md) and [`pio_state_machines_design.md` §4.4](pio_state_machines_design.md).
-- **LPT data-bus direction GPIO** (Phase 4+ blocker): 74LVC161284 needs a direction pin for Byte/EPP/ECP reverse modes where the Pico drives the data bus. Not enumerated in the current hardware reference; needs board verification or addition.
+- ~~**LPT data-bus direction GPIO** (Phase 4+ blocker)~~ **resolved** — `docs/hardware_reference.md` §11.3 assigns GP0 → HD (chip pin 1, driver style) and GP29 → DIR (chip pin 48, data-bus direction). Pre-build hook in `LptMux::switch_to` drives both per target mode; EPP's per-cycle DIR flip handled by `lpt/pio_dir_follower.rs` on PIO0 SM2.
 - **LPT status-bit GPIO mapping** (cleanup): nibble + phase output pins are non-consecutive (GP23, GP25, GP26, GP27 + GP24 in middle). Current design works via CPU pre-shuffling (~20 ns/byte cost); a v2 board could lay them consecutive for cleaner `out pins, 5`.
 - **PSRAM integration:** `embassy-rp` doesn't have first-class PSRAM support yet. Plan: configure QSPI controller manually at boot, add `PSRAM : ORIGIN = 0x11000000, LENGTH = 8M` region to `memory.x`, tag screen buffers with `#[link_section = ".psram"]`. Not needed until Phase 7.
 - **PSRAM cache coherency for ECP DMA** (Phase 5+): RP2350 PSRAM-as-XIP requires explicit cache flush before DMA reads. Pick single-block vs full-cache flush primitive once Phase 5 lands.
